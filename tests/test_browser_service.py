@@ -28,7 +28,7 @@ URLS = {
 class BrowserServiceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         (self.root / "outputs").mkdir()
         for index, env_id in enumerate(("piaoju", "shop01", "shop02")):
             roles = ("goods",) if env_id == "piaoju" else ("invoice", "orders")

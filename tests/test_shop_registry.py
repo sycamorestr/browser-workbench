@@ -22,7 +22,7 @@ def create_in_process(registry_path, folder, name, queue):
 class ShopRegistryTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "shops.json"
         self.original = b'{"schema_version":1,"shops":[{"id":"shop01","store":"Existing"}]}'
         self.source.write_bytes(self.original)
