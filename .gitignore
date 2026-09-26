@@ -1,0 +1,26 @@
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.venv/
+.env*
+*.log
+runtime/
+profiles/
+downloads/
+outputs/
+settings.json
+shops.json
+.browser-workbench-*
+.qianniu-browser*
+profile/
+user-data/
+data/
+private/
+browser.json
+browser.local.json
+*.sqlite*
+*.db
+*.db-journal
+Cookies
+Local State

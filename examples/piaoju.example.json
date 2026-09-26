@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "browser": "Edge",
+  "user_data_dir": "profiles/piaoju",
+  "profile_directory": "Default",
+  "remote_debugging_port": 19222,
+  "download_dir": "downloads/piaoju",
+  "browser_sessions": {
+    "goods": {
+      "url": "https://fp.erp321.com/setting/goodsManage"
+    }
+  }
+}
