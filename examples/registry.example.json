@@ -1,13 +1,4 @@
 {
   "schema_version": 1,
-  "jst_browser_config": "piaoju.json",
-  "output_root": "outputs",
-  "shops": [
-    {
-      "id": "shop01",
-      "store": "我的店铺",
-      "login_username": "",
-      "browser_config": "shop01.json"
-    }
-  ]
+  "shops": []
 }

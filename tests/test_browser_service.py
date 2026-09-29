@@ -23,6 +23,7 @@ URLS = {
     "orders": "https://myseller.taobao.com/home.htm/trade-platform/tp/sold",
     "goods": "https://fp.erp321.com/setting/goodsManage",
 }
+CUSTOM_HOME = "https://portal.example.test/workspace?tenant=demo#overview"
 
 
 class BrowserServiceTests(unittest.TestCase):
@@ -56,6 +57,21 @@ class BrowserServiceTests(unittest.TestCase):
         return {"pid": 321, "root": normalized_path(env.root), "profile": "Default", "port": env.port,
                 "name": "msedge.exe", "started_at": "2026-01-01T00:00:00Z", **overrides}
 
+    def generic_environment(self, home_url=CUSTOM_HOME):
+        previous = self.service.environments["shop01"]
+        config = json.loads(previous.config_path.read_text(encoding="utf-8"))
+        config["browser_sessions"] = {"home": {"url": home_url}}
+        previous.config_path.write_text(json.dumps(config), encoding="utf-8")
+        with patch.object(service_module, "_resolve_browser_executable", return_value=self.root / "msedge.exe"):
+            env = self.service._load_environment("shop01", previous.name, "shop", str(previous.config_path))
+        self.service.environments[env.id] = env
+        return env
+
+    @staticmethod
+    def probe_controller(page):
+        return Mock(start=AsyncMock(), connect=AsyncMock(), close=AsyncMock(),
+                    probe_page=AsyncMock(return_value=(page, "probe-target")))
+
     @staticmethod
     def playwright(browser):
         runtime = SimpleNamespace(chromium=SimpleNamespace(connect_over_cdp=AsyncMock(return_value=browser)),
@@ -80,6 +96,96 @@ class BrowserServiceTests(unittest.TestCase):
         self.assertEqual(by_id["shop01"]["configured_urls"], {"home": URLS["home"]})
         self.assertTrue(by_id["shop01"]["cdp_endpoint"].endswith(str(record["port"])))
         self.assertEqual(by_id["shop01"]["tabs_count"], 2)
+        self.assertTrue(all(row["kind"] == "browser" for row in first["environments"]))
+        self.assertEqual(by_id["piaoju"]["name"], "票聚")
+
+    def test_registry_without_legacy_site_starts_and_empty_install_can_create_environment(self):
+        self.service.shutdown()
+        raw = json.loads(self.registry.read_text(encoding="utf-8"))
+        raw.pop("jst_browser_config")
+        self.registry.write_text(json.dumps(raw), encoding="utf-8")
+        with patch.object(service_module, "_resolve_browser_executable", return_value=self.root / "msedge.exe"):
+            self.service = BrowserService(self.registry)
+        self.assertEqual(set(self.service.environments), {"shop01", "shop02"})
+        self.service.shutdown()
+        raw["shops"] = []
+        self.registry.write_text(json.dumps(raw), encoding="utf-8")
+        with patch.object(service_module, "_resolve_browser_executable", return_value=self.root / "msedge.exe"):
+            self.service = BrowserService(self.registry)
+        self.assertEqual(self.service.environments, {})
+        with patch.object(service_module, "enumerate_browser_processes", return_value=[]):
+            self.assertEqual(self.service.snapshot()["summary"]["total"], 0)
+        for action in (lambda: self.service.close_all_shops({"pause_maintenance": True}), self.service.run_maintenance):
+            with self.assertRaises(BrowserServiceError) as caught:
+                action()
+            self.assertEqual(caught.exception.code, "no_environments")
+        with patch.object(service_module, "PlaywrightBrowserController") as browser:
+            created = self.service.create_shop({"name": "独立浏览器", "parent_folder": str(self.root),
+                                                "login_username": "", "home_url": CUSTOM_HOME})
+            browser.assert_not_called()
+        self.assertEqual(created["kind"], "browser")
+        self.assertIn(created["id"], self.service.environments)
+        self.assertNotIn("piaoju", self.service.environments)
+
+    def test_legacy_site_keeps_profile_port_roles_and_cookie_scope_after_public_unification(self):
+        env = self.service.environments["piaoju"]
+        self.assertEqual(env.kind, "shared")
+        self.assertEqual(env.root, self.root / "piaoju")
+        self.assertEqual(env.port, 19000)
+        self.assertEqual(env.config["browser_sessions"], {"goods": {"url": URLS["goods"]}})
+        browser = Mock()
+        with patch.object(service_module, "persist_session_cookies", new_callable=AsyncMock,
+                          return_value={**empty_status(), "status": "saved"}) as save:
+            asyncio.run(self.service._save_session(env, browser))
+        self.assertEqual(save.call_args.args[1], {"erp321.com"})
+        self.assertEqual(save.call_args.args[2], {"fp.erp321.com"})
+
+    def test_default_url_checks_use_probe_without_platform_scripts_for_all_sites(self):
+        for env_id in ("shop01", "piaoju"):
+            env = self.service.environments[env_id]
+            page = Mock(url=env.home_url)
+            with patch.object(service_module, "probe_login_url", new_callable=AsyncMock,
+                              return_value={"status": "assumed", "message": "推定已登录"}) as probe, \
+                    patch.object(self.service, "_platform_auth", new_callable=AsyncMock) as platform:
+                auth = asyncio.run(self.service._check_auth(env, page))
+            self.assertEqual(auth["status"], "assumed")
+            probe.assert_awaited_once_with(page, env.home_url, service_module.login_settings.DEFAULTS)
+            platform.assert_not_awaited()
+
+    def test_generic_start_uses_configured_home_and_saves_only_its_site(self):
+        env = self.generic_environment()
+        page = Mock(url=CUSTOM_HOME)
+        controller = self.probe_controller(page)
+        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller) as factory, \
+                patch.object(self.service, "_require_owner", return_value=self.process()), \
+                patch.object(service_module, "probe_login_url", new_callable=AsyncMock,
+                             return_value={"status": "assumed", "message": "推定已登录"}) as probe, \
+                patch.object(service_module, "persist_session_cookies", new_callable=AsyncMock,
+                             return_value={**empty_status(), "status": "saved"}) as save:
+            value = asyncio.run(self.service._browser_action("start", env))
+        self.assertEqual(factory.call_args.args[0]["browser_sessions"], {"home": {"url": CUSTOM_HOME}})
+        self.assertTrue(factory.call_args.kwargs["login_probe_mode"])
+        self.assertEqual(value["auth"]["status"], "assumed")
+        self.assertEqual(value["cookie_sync"]["status"], "saved")
+        self.assertEqual(save.call_args.args[1:3], (set(), {"portal.example.test"}))
+        probe.assert_awaited_once_with(page, CUSTOM_HOME, service_module.login_settings.DEFAULTS)
+        controller.close.assert_awaited_once()
+
+    def test_auth_adapter_uses_configured_home_instead_of_legacy_environment_kind(self):
+        self.assertEqual(self.generic_environment().auth_adapter, "generic")
+        self.assertEqual(self.generic_environment("https://myseller.taobao.com.attacker.test/").auth_adapter, "generic")
+        self.assertEqual(self.generic_environment(URLS["home"]).auth_adapter, "qianniu")
+        env = self.generic_environment(URLS["goods"])
+        self.assertEqual(env.auth_adapter, "jst")
+        self.assertEqual(env.home_role, "home")
+        self.assertEqual(env.kind, "shop")
+
+    def test_generic_page_selection_does_not_reuse_another_login_tenant(self):
+        env = self.generic_environment("https://portal.example.test/login?tenant=one")
+        other = Mock(url="https://portal.example.test/login?tenant=two", is_closed=Mock(return_value=False))
+        with self.assertRaises(BrowserServiceError) as caught:
+            self.service._business_page(env, [other])
+        self.assertEqual(caught.exception.code, "page_missing")
 
     def test_foreign_profile_port_conflict_is_not_contacted_or_claimed_running(self):
         record = self.process(root=normalized_path(self.root / "foreign"))
@@ -167,61 +273,164 @@ class BrowserServiceTests(unittest.TestCase):
         self.assertEqual(calls, [("start", "shop01"), ("focus", "shop02")])
         self.assertTrue(all(job["status"] == "complete" for job in self.service._jobs))
 
+    def test_shutdown_drains_active_and_queued_actions_without_adding_browser_close(self):
+        entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+        def perform(action, env):
+            calls.append((action, env.id))
+            if len(calls) == 1:
+                entered.set()
+                release.wait()
+            return {"message": "完成"}
+        def drain():
+            self.service.shutdown()
+            drained.set()
+        waiter = threading.Thread(target=drain, daemon=True)
+        with patch.object(self.service, "_perform", side_effect=perform), \
+                patch.object(service_module, "PlaywrightBrowserController") as controller:
+            try:
+                self.service.submit("focus", ["shop01"])
+                self.assertTrue(entered.wait(1))
+                self.service.submit("save-session", ["shop02", "piaoju"])
+                self.service.shutdown(wait=False)
+                self.service.shutdown(wait=False)
+                waiter.start()
+                self.assertFalse(drained.wait(0.1), "a repeated shutdown must still wait for busy work")
+                self.assertTrue(self.service._worker.is_alive())
+                release.set()
+                self.assertTrue(drained.wait(2))
+            finally:
+                release.set()
+                if waiter.ident is not None:
+                    waiter.join(2)
+            controller.assert_not_called()
+        self.assertEqual(calls, [("focus", "shop01"), ("save-session", "shop02"), ("save-session", "piaoju")])
+        self.assertFalse(self.service._worker.is_alive())
+        self.assertEqual(self.service._queue.unfinished_tasks, 0)
+        self.assertTrue(all(job["status"] == "complete" for job in self.service._jobs))
+
+    def test_stopping_rejects_mutations_and_stops_automatic_work_without_changing_settings(self):
+        settings = {"enabled": True, "interval_minutes": 120, "include_shared": True}
+        self.service.update_maintenance(settings)
+        persisted = self.service._maintenance_path.read_bytes()
+        self.service.shutdown()
+        mutations = [lambda: self.service.submit("start", ["shop01"]),
+                     lambda: self.service.close_all_shops({"pause_maintenance": True}),
+                     lambda: self.service.create_shop({}),
+                     lambda: self.service.update_maintenance(settings),
+                     self.service.run_maintenance]
+        for mutate in mutations:
+            with self.assertRaises(BrowserServiceError) as caught:
+                mutate()
+            self.assertEqual(caught.exception.code, "service_closed")
+        self.service._maintenance["next_run_at"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        self.service._next_cookie_sync = {key: 0 for key in self.service.environments}
+        with patch.object(self.service, "_perform") as action, \
+                patch.object(self.service, "_browser_action", new_callable=AsyncMock) as checkpoint:
+            self.service._maintenance_tick()
+            self.service._idle_checkpoint()
+            action.assert_not_called()
+            checkpoint.assert_not_awaited()
+        self.assertTrue(self.service.maintenance_snapshot()["enabled"])
+        self.assertEqual(self.service._maintenance_path.read_bytes(), persisted)
+
+    def test_shutdown_finishes_current_maintenance_shop_and_skips_rest_before_manual_queue(self):
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+        self.service.update_maintenance({"enabled": True, "interval_minutes": 120, "include_shared": True})
+        def perform(action, env):
+            calls.append((action, env.id))
+            if action == "maintain-session":
+                entered.set()
+                release.wait()
+            return {"auth": {"status": "verified"}, "message": "完成"}
+        with patch.object(self.service, "_perform", side_effect=perform):
+            try:
+                self.service.run_maintenance()
+                self.assertTrue(entered.wait(1))
+                self.service.submit("focus", ["piaoju"])
+                self.service.shutdown(wait=False)
+            finally:
+                release.set()
+            self.service.shutdown()
+        self.assertEqual(calls, [("maintain-session", "shop01"), ("focus", "piaoju")])
+        maintenance = self.service.maintenance_snapshot()
+        self.assertFalse(maintenance["running"])
+        self.assertTrue(maintenance["enabled"])
+        self.assertEqual(maintenance["last_status"], "paused")
+        self.assertEqual([result["status"] for result in maintenance["last_results"]], ["complete", "skipped", "skipped"])
+        self.assertEqual(self.service._queue.unfinished_tasks, 0)
+
+    def test_shutdown_waits_for_shop_creation_that_already_started_writing(self):
+        entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+        original = service_module.shop_registry.create_shop
+        created = []
+        def create(*args):
+            entered.set()
+            release.wait()
+            return original(*args)
+        def drain():
+            self.service.shutdown()
+            drained.set()
+        creator = threading.Thread(target=lambda: created.append(self.service.create_shop(
+            {"name": "停机前创建", "parent_folder": str(self.root), "login_username": "", "home_url": CUSTOM_HOME})), daemon=True)
+        waiter = threading.Thread(target=drain, daemon=True)
+        with patch.object(service_module.shop_registry, "create_shop", side_effect=create):
+            try:
+                creator.start()
+                self.assertTrue(entered.wait(1))
+                self.service.shutdown(wait=False)
+                waiter.start()
+                self.assertFalse(drained.wait(0.1))
+            finally:
+                release.set()
+                creator.join(3)
+                if waiter.ident is not None:
+                    waiter.join(3)
+        self.assertTrue(drained.is_set())
+        self.assertEqual(len(created), 1)
+        self.assertIn(created[0]["id"], self.service.environments)
+
     def test_start_reuses_controller_and_does_not_force_close_native_browser(self):
-        page = Mock(url=URLS["home"], is_closed=Mock(return_value=False),
-                    evaluate=AsyncMock(return_value={"verified": True, "store": "示例店铺一"}))
-        controller = Mock(start=AsyncMock(), close=AsyncMock(), context=SimpleNamespace(pages=[page]))
+        env = self.service.environments["shop01"]
+        page = Mock(url=env.home_url)
+        controller = self.probe_controller(page)
         with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
                 patch.object(self.service, "_require_owner", return_value=self.process()), \
+                patch.object(service_module, "probe_login_url", new_callable=AsyncMock,
+                             return_value={"status": "assumed", "message": "推定已登录"}), \
                 patch.object(self.service, "_save_session", new_callable=AsyncMock,
                              return_value={**empty_status(), "status": "saved"}) as save:
-            value = asyncio.run(self.service._browser_action("start", self.service.environments["shop01"]))
-        controller.start.assert_awaited_once_with(open_missing=True)
+            value = asyncio.run(self.service._browser_action("start", env))
+        controller.start.assert_awaited_once_with(open_missing=False)
         controller.close.assert_awaited_once()
         controller.stop.assert_not_called()
-        self.assertIn("复用", value["message"])
-        self.assertEqual(value["auth"]["status"], "verified")
+        self.assertEqual(value["auth"]["status"], "assumed")
         save.assert_awaited_once()
-        with patch.object(service_module, "enumerate_browser_processes", return_value=[self.process()]), \
-                patch.object(service_module, "probe_cdp", return_value={"available": True, "tabs_count": 1}):
-            snapshot = self.service.snapshot()
-        row = next(row for row in snapshot["environments"] if row["id"] == "shop01")
-        self.assertEqual(row["auth"]["status"], "verified")
 
-    def test_start_login_redirect_is_reported_as_manual_login(self):
-        controller = Mock(start=AsyncMock(side_effect=BrowserControllerError("login", "login_required")), close=AsyncMock())
+    def test_final_login_redirect_sets_required_without_saving_and_keeps_probe_target(self):
+        env = self.service.environments["piaoju"]
+        page = Mock(url="https://identity.example.test/login")
+        controller = self.probe_controller(page)
         with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
-                patch.object(self.service, "_require_owner", return_value=self.process("piaoju")):
-            asyncio.run(self.service._browser_action("start", self.service.environments["piaoju"]))
-        self.assertEqual(self.service._auth["piaoju"]["status"], "required")
-        controller.start.assert_awaited_once()
+                patch.object(self.service, "_require_owner", return_value=self.process("piaoju")), \
+                patch.object(service_module, "probe_login_url", new_callable=AsyncMock,
+                             return_value={"status": "required", "message": "需要登录"}), \
+                patch.object(self.service, "_save_session", new_callable=AsyncMock) as save:
+            value = asyncio.run(self.service._browser_action("start", env))
+        self.assertEqual(value["auth"]["status"], "required")
+        self.assertIn(env.id, self.service._maintenance_required)
+        self.assertEqual(self.service._probe_targets[env.id]["url"], page.url)
+        save.assert_not_awaited()
+        controller.close.assert_awaited_once()
 
-    def test_start_page_missing_with_exited_browser_requests_explicit_reopen(self):
-        controller = Mock(start=AsyncMock(side_effect=BrowserControllerError("loading", "page_missing")),
-                          close=AsyncMock())
-        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
-                patch.object(self.service, "_require_owner",
-                             side_effect=BrowserServiceError("stopped", "browser_stopped")):
-            with self.assertRaises(BrowserServiceError) as error:
+    def test_probe_connection_failure_marks_error_and_disconnects_without_stopping_browser(self):
+        controller = Mock(start=AsyncMock(side_effect=BrowserControllerError("failed", "browser_launch_failed")), close=AsyncMock())
+        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller):
+            with self.assertRaises(BrowserControllerError):
                 asyncio.run(self.service._browser_action("start", self.service.environments["piaoju"]))
-        self.assertEqual(error.exception.code, "browser_stopped")
-        self.assertIn("重新打开", str(error.exception))
-        self.assertNotIn("等待加载", str(error.exception))
-        controller.start.assert_awaited_once()
-        controller.stop.assert_not_called()
-        self.assertEqual(self.service._auth["piaoju"]["status"], "unchecked")
-
-    def test_start_page_missing_with_running_owned_browser_requests_recheck(self):
-        controller = Mock(start=AsyncMock(side_effect=BrowserControllerError("loading", "page_missing")),
-                          close=AsyncMock())
-        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
-                patch.object(self.service, "_require_owner", return_value=self.process("piaoju")) as owner:
-            with self.assertRaises(BrowserServiceError) as error:
-                asyncio.run(self.service._browser_action("start", self.service.environments["piaoju"]))
-        self.assertEqual(error.exception.code, "page_missing")
-        self.assertIn("等待加载", str(error.exception))
-        owner.assert_called_once()
-        controller.start.assert_awaited_once()
+        self.assertEqual(self.service._auth["piaoju"]["status"], "error")
+        controller.close.assert_awaited_once()
         controller.stop.assert_not_called()
 
     def test_check_login_does_not_start_a_stopped_browser(self):
@@ -248,7 +457,7 @@ class BrowserServiceTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "invalid_close_all")
         self.assertEqual(self.service._jobs, [])
 
-    def test_close_all_includes_stopped_shops_after_queued_start_and_excludes_shared(self):
+    def test_close_all_includes_all_environments_after_queued_start_including_legacy_shared(self):
         entered, finish = threading.Event(), threading.Event()
         calls = []
         def perform(action, env):
@@ -267,22 +476,22 @@ class BrowserServiceTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, "close_all_busy")
                 close_job = next(job for job in self.service._jobs if job["id"] == result["id"])
                 self.assertTrue(close_job["close_all"])
-                self.assertEqual(close_job["ids"], ["shop01", "shop02"])
+                self.assertEqual(close_job["ids"], ["shop01", "shop02", "piaoju"])
             finally:
                 finish.set()
             self.service._queue.join()
-        self.assertEqual(calls, [("start", "shop01"), ("close", "shop01"), ("close", "shop02")])
+        self.assertEqual(calls, [("start", "shop01"), ("close", "shop01"), ("close", "shop02"), ("close", "piaoju")])
         self.assertIsNone(self.service._close_all_job_id)
 
     def test_close_all_one_failure_does_not_block_other_shops_or_future_close_all(self):
         with patch.object(self.service, "_perform", side_effect=[
-                BrowserServiceError("会话保存失败", "cookie_sync_failed"), {"message": "已关闭"}]) as perform:
+                BrowserServiceError("会话保存失败", "cookie_sync_failed"), {"message": "已关闭"}, {"message": "已关闭"}]) as perform:
             result = self.service.close_all_shops({"pause_maintenance": True})
             self.service._queue.join()
-        self.assertEqual(perform.call_count, 2)
+        self.assertEqual(perform.call_count, 3)
         job = next(job for job in self.service._jobs if job["id"] == result["id"])
         self.assertEqual(job["status"], "partial")
-        self.assertEqual([row["status"] for row in job["results"]], ["failed", "complete"])
+        self.assertEqual([row["status"] for row in job["results"]], ["failed", "complete", "complete"])
         self.assertIsNone(self.service._close_all_job_id)
         with patch.object(self.service, "_perform", return_value={"message": "已关闭"}):
             self.service.close_all_shops({"pause_maintenance": False})
@@ -294,12 +503,14 @@ class BrowserServiceTests(unittest.TestCase):
         parent.mkdir()
         with patch.object(service_module, "PlaywrightBrowserController") as create:
             result = self.service.create_shop({"name": "自定义测试店", "parent_folder": str(parent),
-                                               "login_username": "test-account"})
+                                               "login_username": "test-account", "home_url": CUSTOM_HOME})
         create.assert_not_called()
+        self.assertEqual(result["kind"], "browser")
         self.assertEqual(self.registry.read_bytes(), original)
         env = self.service.environments[result["id"]]
         self.assertEqual(env.login_username, "test-account")
-        self.assertEqual(env.config["browser_sessions"], {"home": {"url": service_module.QIANNIU_HOME_URL}})
+        self.assertEqual(env.config["browser_sessions"], {"home": {"url": CUSTOM_HOME}})
+        self.assertEqual(result["home_url"], CUSTOM_HOME)
         self.assertEqual(self.service._auth[env.id]["status"], "unchecked")
         self.assertEqual(self.service._pending[env.id], 0)
         self.assertIn(env.id, self.service._next_cookie_sync)
@@ -310,12 +521,16 @@ class BrowserServiceTests(unittest.TestCase):
         row = next(row for row in snapshot["environments"] if row["id"] == env.id)
         self.assertFalse(row["running"])
         self.assertEqual(row["login_username"], "test-account")
+        self.assertEqual(row["home_url"], CUSTOM_HOME)
+        self.assertEqual(row["configured_urls"]["home"], "https://portal.example.test/workspace")
         self.service.shutdown()
         with patch.object(service_module, "_resolve_browser_executable", return_value=self.root / "msedge.exe"):
             self.service = BrowserService(self.registry)
         self.assertIn(env.id, self.service.environments)
         self.assertEqual(self.service.environments[env.id].root, env.root)
         self.assertEqual(self.service.environments[env.id].login_username, "test-account")
+        self.assertEqual(self.service.environments[env.id].home_url, CUSTOM_HOME)
+        self.assertEqual(self.service.environments[env.id].auth_adapter, "generic")
         self.assertEqual(self.registry.read_bytes(), original)
 
     def test_create_shop_uses_immutable_environment_replacement_during_inventory(self):
@@ -325,7 +540,7 @@ class BrowserServiceTests(unittest.TestCase):
         created = []
         def inventory():
             created.append(self.service.create_shop({"name": "并发创建测试店", "parent_folder": str(parent),
-                                                     "login_username": ""}))
+                                                     "login_username": "", "home_url": CUSTOM_HOME}))
             return []
         with patch.object(service_module, "enumerate_browser_processes", side_effect=inventory):
             snapshot = self.service.snapshot()
@@ -336,45 +551,45 @@ class BrowserServiceTests(unittest.TestCase):
         self.assertEqual(snapshot["summary"]["total"], 4)
 
     def test_create_shop_factory_errors_preserve_typed_code(self):
-        error = service_module.shop_registry.ShopRegistryError("invalid_shop", "店铺设置无效")
+        error = service_module.shop_registry.ShopRegistryError("invalid_shop", "环境设置无效")
         with patch.object(service_module.shop_registry, "create_shop", side_effect=error):
             with self.assertRaises(BrowserServiceError) as caught:
                 self.service.create_shop({})
         self.assertEqual(caught.exception.code, "invalid_shop")
-        self.assertEqual(caught.exception.message, "店铺设置无效")
+        self.assertEqual(caught.exception.message, "环境设置无效")
         self.assertEqual(len(self.service.environments), 3)
 
     def test_login_page_never_executes_identity_requests(self):
         page = Mock(url="https://loginmyseller.taobao.com/", evaluate=AsyncMock())
-        result = asyncio.run(self.service._check_auth(self.service.environments["shop01"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["shop01"], page))
         self.assertEqual(result["status"], "required")
         page.evaluate.assert_not_awaited()
 
     def test_shop_display_name_does_not_have_to_match_registry(self):
         page = Mock(url=URLS["home"], evaluate=AsyncMock(return_value={"verified": True, "store": "其他测试店铺"}))
-        result = asyncio.run(self.service._check_auth(self.service.environments["shop01"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["shop01"], page))
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["identity"], "其他测试店铺")
 
     def test_shop_login_does_not_require_display_name_but_still_requires_evidence(self):
         page = Mock(url=URLS["home"], evaluate=AsyncMock(return_value={"verified": True}))
-        result = asyncio.run(self.service._check_auth(self.service.environments["shop01"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["shop01"], page))
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["identity"], "")
         page.evaluate.return_value = {"store": "示例店铺一"}
-        result = asyncio.run(self.service._check_auth(self.service.environments["shop01"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["shop01"], page))
         self.assertEqual(result["status"], "error")
         page.evaluate.side_effect = RuntimeError("network failed")
-        result = asyncio.run(self.service._check_auth(self.service.environments["shop01"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["shop01"], page))
         self.assertEqual(result["status"], "error")
 
     def test_jst_cached_dom_and_resource_ids_are_not_sufficient(self):
         frame = Mock(url=service_module.GOODS_FRAME_URL, evaluate=AsyncMock(return_value={"coid": "test", "uid": "test"}))
         page = Mock(url=URLS["goods"], frames=[frame], evaluate=AsyncMock(return_value="示例有限公司[测试员]"))
-        result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "error")
         frame.evaluate.return_value = {"coid": "test", "uid": "test", "verified": True}
-        result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["identity"], "示例有限公司")
 
@@ -385,7 +600,7 @@ class BrowserServiceTests(unittest.TestCase):
         async def frame_ready(_duration):
             page.frames = [frame]
         with patch.object(service_module.asyncio, "sleep", side_effect=frame_ready) as pause:
-            result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+            result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "verified")
         page.evaluate.assert_awaited_once()
         frame.evaluate.assert_awaited_once()
@@ -397,7 +612,7 @@ class BrowserServiceTests(unittest.TestCase):
         async def redirect(_duration):
             page.url = "https://www.erp321.com/login.aspx"
         with patch.object(service_module.asyncio, "sleep", side_effect=redirect):
-            result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+            result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "required")
         frame.evaluate.assert_not_awaited()
         page.evaluate.assert_not_awaited()
@@ -408,27 +623,27 @@ class BrowserServiceTests(unittest.TestCase):
         page = Mock(url=URLS["goods"], frames=[frame], evaluate=AsyncMock(return_value="另一家测试公司[用户]"))
         for issuer in ("示例有限公司", ""):
             self.service.issuer = issuer
-            result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+            result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
             self.assertEqual(result["status"], "verified")
             self.assertEqual(result["identity"], "另一家测试公司")
 
     def test_jst_optional_label_failure_does_not_hide_valid_login(self):
         frame = Mock(url=service_module.GOODS_FRAME_URL, evaluate=AsyncMock(return_value={"verified": True}))
         page = Mock(url=URLS["goods"], frames=[frame], evaluate=AsyncMock(side_effect=RuntimeError("label absent")))
-        result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "verified")
         self.assertEqual(result["identity"], "")
         frame.evaluate.return_value = {"required": True}
-        result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "required")
         frame.evaluate.side_effect = RuntimeError("network failed")
-        result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+        result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "error")
 
     def test_jst_loading_timeout_is_actionable_without_claiming_login_success(self):
         page = Mock(url=URLS["goods"], frames=[], evaluate=AsyncMock(return_value=""))
         with patch.object(service_module, "JST_PAGE_READY_SECONDS", 0):
-            result = asyncio.run(self.service._check_auth(self.service.environments["piaoju"], page))
+            result = asyncio.run(self.service._platform_auth(self.service.environments["piaoju"], page))
         self.assertEqual(result["status"], "error")
         self.assertIn("重新检查", result["message"])
 
@@ -492,27 +707,36 @@ class BrowserServiceTests(unittest.TestCase):
         self.assertEqual(self.service._cookie_sync["shop01"]["status"], "error")
         browser.new_browser_cdp_session.assert_not_awaited()
 
-    def test_login_check_saves_only_after_positive_login_evidence(self):
-        page = Mock(url=URLS["home"], is_closed=Mock(return_value=False),
-                    evaluate=AsyncMock(return_value={"verified": True, "store": "示例店铺一"}))
-        browser = Mock(contexts=[SimpleNamespace(pages=[page])], close=AsyncMock())
-        _, playwright = self.playwright(browser)
-        with playwright, patch.object(self.service, "_require_owner", return_value=self.process()), \
+    def test_check_login_only_saves_assumed_or_verified_success(self):
+        env = self.service.environments["shop01"]
+        page = Mock(url=env.home_url)
+        controller = self.probe_controller(page)
+        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
+                patch.object(self.service, "_require_owner", return_value=self.process()), \
+                patch.object(service_module, "probe_login_url", new_callable=AsyncMock) as probe, \
                 patch.object(self.service, "_save_session", new_callable=AsyncMock,
                              return_value={**empty_status(), "status": "saved"}) as save:
-            result = asyncio.run(self.service._browser_action("check-login", self.service.environments["shop01"]))
-            self.assertEqual(result["auth"]["status"], "verified")
-            save.assert_awaited_once()
-            save.reset_mock()
-            page.evaluate.return_value = {"verified": True, "store": "其他店铺"}
-            result = asyncio.run(self.service._browser_action("check-login", self.service.environments["shop01"]))
-            self.assertEqual(result["auth"]["status"], "verified")
-            save.assert_awaited_once()
-            save.reset_mock()
-            page.evaluate.return_value = {"required": True}
-            result = asyncio.run(self.service._browser_action("check-login", self.service.environments["shop01"]))
-            self.assertEqual(result["auth"]["status"], "required")
-            save.assert_not_awaited()
+            for status in ("assumed", "required", "error"):
+                probe.return_value = {"status": status, "message": status}
+                result = asyncio.run(self.service._browser_action("check-login", env))
+                self.assertEqual(result["auth"]["status"], status)
+                self.assertEqual(save.await_count, 1 if status == "assumed" else 0)
+                save.reset_mock()
+        self.assertEqual(controller.connect.await_count, 3)
+        controller.start.assert_not_awaited()
+
+    def test_platform_mode_runs_legacy_probe_only_after_successful_navigation(self):
+        env = self.service.environments["shop01"]
+        self.service.update_login_check(env.id, {"mode": "platform", "login_url": "", "wait_seconds": 1})
+        page = Mock(url=env.home_url)
+        with patch.object(service_module, "probe_login_url", new_callable=AsyncMock) as probe, \
+                patch.object(self.service, "_platform_auth", new_callable=AsyncMock,
+                             return_value={"status": "verified", "message": "已核验"}) as platform:
+            for status in ("error", "required", "assumed"):
+                probe.return_value = {"status": status, "message": status}
+                auth = asyncio.run(self.service._check_auth(env, page))
+                self.assertEqual(auth["status"], "verified" if status == "assumed" else status)
+            platform.assert_awaited_once_with(env, page)
 
     def test_manual_save_does_not_need_business_pages_or_run_login_checks(self):
         browser = Mock(contexts=[], close=AsyncMock())

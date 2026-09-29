@@ -1,7 +1,7 @@
 import { LoaderCircle } from 'lucide-react';
 import type { Environment } from '../types';
 
-const authLabels = { verified: '已登录', required: '需登录', unchecked: '未检查', error: '检查失败' };
+const authLabels = { verified: '已验证登录', assumed: '推定已登录', required: '需登录', unchecked: '未检查', error: '检查失败' };
 const cdpLabels = { connected: '已连接', unavailable: '未响应', stopped: '未启动', conflict: '端口冲突' };
 
 export function RunningStatus({ environment, pending = false }: { environment: Environment; pending?: boolean }) {

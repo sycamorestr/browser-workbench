@@ -13,7 +13,7 @@ from typing import Any
 
 FILE_NAME = ".browser-workbench-maintenance.json"
 INTERVALS = {30, 60, 120, 240, 720, 1440}
-SETTING_KEYS = {"enabled", "interval_minutes", "include_shared"}
+SETTING_KEYS = {"enabled", "interval_minutes"}
 STATUSES = {"idle", "running", "complete", "partial", "failed", "paused"}
 
 
@@ -37,15 +37,18 @@ def valid_timestamp(value: Any) -> str | None:
 
 
 def validate_settings(value: Any) -> dict[str, Any]:
-    if (not isinstance(value, dict) or set(value) != SETTING_KEYS
-            or type(value["enabled"]) is not bool or type(value["include_shared"]) is not bool
+    if (not isinstance(value, dict) or set(value) not in (SETTING_KEYS, SETTING_KEYS | {"include_shared"})
+            or type(value["enabled"]) is not bool
+            or ("include_shared" in value and type(value["include_shared"]) is not bool)
             or type(value["interval_minutes"]) is not int or value["interval_minutes"] not in INTERVALS):
         raise ValueError("invalid maintenance settings")
-    return dict(value)
+    # Older clients/settings may still send this flag. Maintenance now always
+    # covers every registered environment, so do not expose or persist it.
+    return {key: value[key] for key in SETTING_KEYS}
 
 
 def initial_state() -> dict[str, Any]:
-    return {"enabled": False, "interval_minutes": 120, "include_shared": True,
+    return {"enabled": False, "interval_minutes": 120,
             "next_run_at": None, "running": False, "last_run_at": None, "last_finished_at": None,
             "last_status": "idle", "last_results": [], "message": "定时维护尚未开启"}
 
@@ -56,7 +59,10 @@ def load(path: Path, names: dict[str, str]) -> tuple[dict[str, Any], set[str]]:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict) or data.get("schema_version") != 1:
             raise ValueError("invalid maintenance state")
-        state.update(validate_settings({key: data[key] for key in SETTING_KEYS}))
+        settings = {key: data[key] for key in SETTING_KEYS}
+        if "include_shared" in data:
+            settings["include_shared"] = data["include_shared"]
+        state.update(validate_settings(settings))
         for key in ("next_run_at", "last_run_at", "last_finished_at"):
             state[key] = valid_timestamp(data.get(key))
         status = data.get("last_status")

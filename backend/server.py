@@ -7,11 +7,15 @@ import json
 import mimetypes
 import secrets
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from .folder_picker import choose_folder
+from .shop_registry import validate_home_url
+from .maintenance import validate_settings
+from .login_settings import validate_settings as validate_login_settings
 
 APP_ID = "browser-workbench"
 APP_VERSION = "0.2.0"
@@ -27,7 +31,37 @@ class WorkbenchServer(ThreadingHTTPServer):
         self.service = service
         self.static_root = static_root.resolve()
         self.csrf_token = secrets.token_urlsafe(32)
+        self._shutdown_lock = threading.Lock()
+        self._stopping = False
+        self._shutdown_thread = None
         super().__init__(address, Handler)
+
+    @property
+    def service_status(self):
+        with self._shutdown_lock:
+            return "stopping" if self._stopping else "running"
+
+    def request_shutdown(self):
+        """Close admission immediately; the response precedes the blocking drain."""
+        with self._shutdown_lock:
+            if not self._stopping:
+                self.service.shutdown(wait=False)
+                self._stopping = True
+
+    def finish_shutdown(self):
+        # Called only after the shutdown response has been written. Never
+        # call HTTPServer.shutdown from its serve_forever thread.
+        with self._shutdown_lock:
+            if self._shutdown_thread is None:
+                self._shutdown_thread = threading.Thread(
+                    target=self._drain_and_stop, name="workbench-shutdown", daemon=False,
+                )
+                self._shutdown_thread.start()
+
+    def _drain_and_stop(self):
+        self.service.shutdown(wait=True)
+        self.shutdown()
+        self.server_close()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -89,12 +123,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = unquote(urlsplit(self.path).path)
         if path == "/api/health":
-            self._json(200, {"app": APP_ID, "version": APP_VERSION, "project_root": str(PROJECT_ROOT)})
+            self._json(200, {"app": APP_ID, "version": APP_VERSION, "project_root": str(PROJECT_ROOT),
+                             "service_status": self.server.service_status})
             return
         if path == "/api/state":
             try:
                 state = self.server.service.snapshot()
-                self._json(200, {**state, "csrf_token": self.server.csrf_token})
+                self._json(200, {**state, "csrf_token": self.server.csrf_token,
+                                 "service_status": self.server.service_status})
             except Exception:
                 self._error(503, "STATE_UNAVAILABLE", "暂时无法读取浏览器状态，请稍后刷新。")
             return
@@ -121,8 +157,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlsplit(self.path).path
         if path not in {"/api/actions", "/api/maintenance", "/api/maintenance/run",
-                        "/api/shops", "/api/shops/close-all", "/api/folders/pick"}:
+                        "/api/environments", "/api/environments/close-all", "/api/shops", "/api/shops/close-all",
+                        "/api/folders/pick", "/api/shutdown", "/api/environments/login-check",
+                        "/api/environments/archive", "/api/environments/restore", "/api/environments/delete"}:
             self._error(404, "NOT_FOUND", "接口不存在。")
+            return
+        if path != "/api/shutdown" and self.server.service_status == "stopping":
+            self._error(409, "service_stopping", "工作台正在停止，无法提交新操作。")
             return
         if self.headers.get_content_type() != "application/json" or self.headers.get("Transfer-Encoding"):
             self._error(415, "CONTENT_TYPE", "请求必须使用 JSON。")
@@ -135,25 +176,51 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(size))
             if not isinstance(payload, dict):
                 raise ValueError("Invalid object")
+            if path == "/api/shutdown":
+                if payload:
+                    raise ValueError("Shutdown accepts no overrides")
+                self.server.request_shutdown()
+                self._json(202, {"status": "stopping"})
+                self.server.finish_shutdown()
+                return
             if path == "/api/folders/pick":
                 if payload:
                     raise ValueError("Folder picker accepts no overrides")
                 self._json(200, choose_folder(str(self.server.service.registry_path.parent)))
                 return
-            if path == "/api/shops":
-                if set(payload) != {"name", "parent_folder", "login_username"}:
-                    raise ValueError("Invalid shop fields")
+            if path in {"/api/environments/archive", "/api/environments/restore", "/api/environments/delete"}:
+                operation = path.rsplit("/", 1)[1]
+                expected = {"environment_id", "confirm_name"} if operation == "delete" else {"environment_id"}
+                if (set(payload) != expected or not isinstance(payload["environment_id"], str)
+                        or not payload["environment_id"]
+                        or (operation == "delete" and (not isinstance(payload["confirm_name"], str) or not payload["confirm_name"]))):
+                    raise ValueError("Invalid environment lifecycle fields")
+                self._json(200, self.server.service.change_environment_lifecycle(
+                    payload["environment_id"], operation, confirm_name=payload.get("confirm_name")))
+                return
+            if path == "/api/environments/login-check":
+                if (set(payload) != {"environment_id", "mode", "login_url", "wait_seconds"}
+                        or not isinstance(payload["environment_id"], str) or not payload["environment_id"]):
+                    raise ValueError("Invalid login check fields")
+                env_id = payload["environment_id"]
+                settings = validate_login_settings({key: value for key, value in payload.items() if key != "environment_id"})
+                result = self.server.service.update_login_check(env_id, settings)
+                self._json(200, {"environment_id": env_id, **result})
+                return
+            if path in {"/api/environments", "/api/shops"}:
+                if set(payload) not in ({"name", "parent_folder", "login_username"},
+                                       {"name", "parent_folder", "login_username", "home_url"}):
+                    raise ValueError("Invalid environment fields")
+                payload["home_url"] = validate_home_url(payload.get("home_url"))
                 self._json(201, {"environment": self.server.service.create_shop(payload)})
                 return
-            if path == "/api/shops/close-all":
+            if path in {"/api/environments/close-all", "/api/shops/close-all"}:
                 if set(payload) != {"pause_maintenance"} or type(payload["pause_maintenance"]) is not bool:
                     raise ValueError("Invalid close-all settings")
                 self._json(202, {"job": self.server.service.close_all_shops(payload)})
                 return
             if path == "/api/maintenance":
-                if set(payload) != {"enabled", "interval_minutes", "include_shared"}:
-                    raise ValueError("Invalid maintenance settings")
-                maintenance = self.server.service.update_maintenance(payload)
+                maintenance = self.server.service.update_maintenance(validate_settings(payload))
                 self._json(200, {"maintenance": maintenance})
                 return
             if path == "/api/maintenance/run":
@@ -174,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             code = getattr(exc, "code", "ACTION_FAILED")
             message = str(exc) if hasattr(exc, "code") else "操作提交失败，请刷新后重试。"
-            status = 409 if "busy" in code.lower() or "conflict" in code.lower() else 503 if code.endswith("storage_failed") else 400
+            status = 409 if "busy" in code.lower() or "conflict" in code.lower() or code == "service_closed" else 503 if code.endswith("storage_failed") else 400
             self._error(status, code, message)
 
 

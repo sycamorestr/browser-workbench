@@ -35,13 +35,21 @@ def empty_status() -> dict[str, Any]:
 
 
 def business_cookie_scope(kind: str, configured_urls: Iterable[str]) -> tuple[set[str], set[str]]:
-    """Known business families plus exact hosts explicitly configured locally."""
-    families = {"erp321.com"} if kind == "shared" else {"taobao.com", "tmall.com"}
+    """Configured hosts, with compatibility families for known site adapters.
+
+    The legacy kind argument is retained for callers, but cannot grant cookie
+    access to unrelated platforms when an environment uses a custom homepage.
+    """
+    families = set()
     hosts = set()
     for url in configured_urls:
         parsed = urlsplit(url)
         if parsed.scheme in {"http", "https"} and parsed.hostname:
             hosts.add(parsed.hostname.lower().rstrip("."))
+            if parsed.hostname.lower() == "myseller.taobao.com":
+                families.update({"taobao.com", "tmall.com"})
+            elif parsed.hostname.lower() == "fp.erp321.com" and parsed.path.rstrip("/") == "/setting/goodsManage":
+                families.add("erp321.com")
     return families, hosts
 
 
@@ -49,7 +57,11 @@ def in_scope(domain: Any, families: set[str], hosts: set[str]) -> bool:
     if not isinstance(domain, str):
         return False
     host = domain.lower().lstrip(".").rstrip(".")
-    return host in hosts or any(host == family or host.endswith("." + family) for family in families)
+    # A parent-domain cookie also applies to the configured host. Include it
+    # without granting access to cookies belonging to unrelated sibling hosts.
+    parent_cookie = domain.startswith(".") and "." in host and any(
+        configured.endswith("." + host) for configured in hosts)
+    return host in hosts or parent_cookie or any(host == family or host.endswith("." + family) for family in families)
 
 
 def persistent_cookie_param(cookie: dict[str, Any], expires: float) -> dict[str, Any]:

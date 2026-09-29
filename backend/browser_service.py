@@ -44,6 +44,9 @@ from .session_cookies import (
     write_metadata as write_cookie_metadata,
 )
 from . import maintenance as maintenance_state
+from . import login_settings
+from . import lifecycle
+from .login_probe import probe_login_url
 from . import shop_registry
 
 
@@ -268,12 +271,32 @@ class Environment:
     def endpoint(self) -> str:
         return f"http://127.0.0.1:{self.port}"
 
+    @property
+    def home_role(self) -> str:
+        return "home" if "home" in self.config["browser_sessions"] else "goods"
+
+    @property
+    def home_url(self) -> str:
+        value = self.config["browser_sessions"][self.home_role]
+        return value["url"] if isinstance(value, dict) else value
+
+    @property
+    def auth_adapter(self) -> str:
+        target = urlsplit(self.home_url)
+        if target.hostname == "myseller.taobao.com":
+            return "qianniu"
+        if target.hostname == "fp.erp321.com" and target.path.rstrip("/") == "/setting/goodsManage":
+            return "jst"
+        return "generic"
+
 
 class BrowserService:
     def __init__(self, registry_path: Path) -> None:
         self.registry_path = Path(registry_path).expanduser().resolve()
         self.issuer = ""
         self.output_root = self.registry_path.parent / "outputs"
+        self._lifecycle_path = self.registry_path.parent / lifecycle.FILE_NAME
+        self._lifecycle = lifecycle.load(self._lifecycle_path)
         self.environments = self._read_registry()
         self._state_lock = threading.RLock()
         self._creation_lock = threading.Lock()
@@ -284,6 +307,10 @@ class BrowserService:
         self._observations: dict[str, dict[str, Any]] = {}
         self._process_keys: dict[str, tuple[Any, ...] | None] = {}
         self._auth = {key: self._unchecked() for key in self.environments}
+        self._login_settings_path = self.registry_path.parent / login_settings.FILE_NAME
+        self._login_checks = login_settings.load(self._login_settings_path)
+        self._probe_targets: dict[str, dict[str, Any]] = {}
+        self._checkpoint_env: str | None = None
         self._cookie_sync = {key: read_cookie_metadata(env.root) for key, env in self.environments.items()}
         self._next_cookie_sync = {key: time.monotonic() + COOKIE_CHECKPOINT_SECONDS for key in self.environments}
         self._idle_retry_after = 0.0
@@ -310,17 +337,25 @@ class BrowserService:
                 raise ValueError("registry")
             self.issuer = str(raw.get("issuer") or "").strip()
             self.output_root = resolve_path(self.registry_path.parent, raw.get("output_root") or "outputs")
-            shops = raw.get("shops")
-            if not isinstance(shops, list) or not shops or not raw.get("jst_browser_config"):
+            shops = raw.get("shops", [])
+            if not isinstance(shops, list):
                 raise ValueError("shops")
-            descriptions = [("piaoju", "共享票聚", "shared", raw["jst_browser_config"], "")]
-            descriptions.extend((str(shop["id"]), str(shop["store"]), "shop", shop["browser_config"],
+            retired_ids = {env_id for env_id, record in self._lifecycle.items() if record["state"] == "deleted"}
+            descriptions = [(str(shop["id"]), str(shop["store"]), "shop", shop["browser_config"],
                                  str(shop.get("login_username") or ""))
-                                for shop in [*shops, *shop_registry.load_custom_shops(self.registry_path)])
+                                for shop in [*shops, *shop_registry.load_custom_shops(self.registry_path, retired_ids=retired_ids)]]
+            # Legacy registry fields remain readable without making this
+            # particular site a required environment or a public category.
+            if raw.get("jst_browser_config"):
+                descriptions.append(("piaoju", "票聚", "shared", raw["jst_browser_config"], ""))
             result = {}
             roots: set[str] = set()
             ports: set[int] = set()
             for env_id, name, kind, path, username in descriptions:
+                if self._lifecycle.get(env_id, {}).get("state") == "deleted":
+                    # A tombstone retains resource reservations, but deleting
+                    # an old config later must not stop unrelated environments.
+                    continue
                 if env_id in result:
                     raise ValueError("duplicate environment")
                 env = self._load_environment(env_id, name, kind, path, username)
@@ -335,7 +370,7 @@ class BrowserService:
         except shop_registry.ShopRegistryError as exc:
             raise BrowserServiceError(exc.message, exc.code) from exc
         except (OSError, ValueError, KeyError, TypeError, BrowserControllerError) as exc:
-            raise BrowserServiceError("店铺清单或浏览器配置无效，请检查配置文件", "configuration") from exc
+            raise BrowserServiceError("环境清单或浏览器配置无效，请检查配置文件", "configuration") from exc
 
     def _load_environment(self, env_id: str, name: str, kind: str, path: str,
                           username: str = "") -> Environment:
@@ -343,16 +378,95 @@ class BrowserService:
             raise ValueError("environment")
         config_path = resolve_path(self.registry_path.parent, path)
         config, _ = load_browser_config(config_path)
-        if kind == "shared" and set(config["browser_sessions"]) != {"goods"}:
-            raise ValueError("roles")
-        if kind == "shop":
-            # The workbench uses its own homepage without rewriting skill URLs.
+        sessions = config["browser_sessions"]
+        if "home" in sessions:
+            # Manage the explicit homepage without overwriting its URL or
+            # opening unrelated legacy invoice/order roles from this panel.
+            config["browser_sessions"] = {"home": sessions["home"]}
+        elif kind == "shared" and set(sessions) == {"goods"}:
+            pass  # Keep the legacy goods page and login adapter compatible.
+        elif (set(sessions).issubset({"invoice", "orders"}) and sessions and
+              all(urlsplit(value["url"] if isinstance(value, dict) else value).hostname == "myseller.taobao.com"
+                  for value in sessions.values())):
+            # Existing invoice-tool profiles had no home role. Preserve this
+            # compatibility only for their known seller-site configuration.
             config["browser_sessions"] = {"home": {"url": QIANNIU_HOME_URL}}
+        else:
+            raise ValueError("missing homepage")
         try:
             executable = str(_resolve_browser_executable(config))
         except BrowserControllerError:
             executable = str(config.get("executable_path") or config.get("browser_executable") or "")
         return Environment(env_id, name.strip(), kind, config_path, config, executable, username)
+
+    def _is_active(self, env_id: str) -> bool:
+        return env_id in self.environments and env_id not in self._lifecycle
+
+    def _active_ids(self) -> list[str]:
+        return [env_id for env_id in self.environments if self._is_active(env_id)]
+
+    @staticmethod
+    def _environment_resource(env: Environment) -> dict[str, Any]:
+        return {"id": env.id, "name": env.name, "user_data_dir": str(env.root),
+                "download_dir": str(env.config["download_dir"]), "debug_port": env.port,
+                "config_path": str(env.config_path), "login_username": env.login_username,
+                "home_url": env.home_url}
+
+    def _environment_has_work(self, env_id: str) -> bool:
+        if self._pending.get(env_id) or self._checkpoint_env == env_id:
+            return True
+        if self._maintenance_job_id:
+            job = next((item for item in self._jobs if item["id"] == self._maintenance_job_id), None)
+            return job is None or env_id in job["ids"]
+        return False
+
+    def change_environment_lifecycle(self, env_id: str, operation: str,
+                                     confirm_name: str | None = None) -> dict[str, str]:
+        if operation not in {"archive", "restore", "delete"}:
+            raise BrowserServiceError("不支持的环境管理操作", "invalid_lifecycle_operation")
+        # Share creation's lock order so the resource list cannot change while
+        # a new environment is allocating its name, profile or debug port.
+        with self._creation_lock:
+            with self._state_lock:
+                if self._closed:
+                    raise BrowserServiceError("工作台正在关闭", "service_closed")
+                if not isinstance(env_id, str) or env_id not in self.environments:
+                    raise BrowserServiceError("请选择仍登记在工作台中的浏览器环境", "invalid_environment")
+                env = self.environments[env_id]
+                archived = not self._is_active(env_id)
+                if operation == "archive" and archived:
+                    raise BrowserServiceError("此环境已经归档", "environment_state_conflict")
+                if operation in {"restore", "delete"} and not archived:
+                    raise BrowserServiceError("请先归档此环境，再执行恢复或删除登记", "environment_state_conflict")
+                if operation == "delete" and confirm_name != env.name:
+                    raise BrowserServiceError("确认名称与环境名称不一致，未删除登记", "confirmation_failed")
+                if self._environment_has_work(env_id) or profile_busy(env.root):
+                    raise BrowserServiceError("此环境仍有任务等待或执行，请完成后再管理登记", "environment_busy")
+                # Do not trust the four-second UI inventory cache for changes.
+                # Holding state admission prevents local work from racing this
+                # check; an external profile lock is checked a second time.
+                inventory = enumerate_browser_processes()
+                record, conflict = self._owned_process(env, inventory)
+                if conflict:
+                    raise BrowserServiceError("此环境的浏览器目录或调试端口存在运行冲突，请先处理", "environment_conflict")
+                if record is not None and operation != "restore":
+                    raise BrowserServiceError("请先关闭此环境的浏览器，再管理登记", "environment_running")
+                if profile_busy(env.root):
+                    raise BrowserServiceError("此环境正被其他任务使用，请完成后再管理登记", "environment_busy")
+                target = {"archive": "archived", "restore": "active", "delete": "deleted"}[operation]
+                updated = lifecycle.save_state(self._lifecycle_path, env_id, target, self._environment_resource(env))
+                self._lifecycle = updated
+                self._auth[env_id] = self._unchecked("环境已恢复，请重新检查登录" if target == "active" else "环境已归档，自动任务已排除")
+                self._probe_targets.pop(env_id, None)
+                if target == "active":
+                    self._next_cookie_sync[env_id] = time.monotonic() + COOKIE_CHECKPOINT_SECONDS
+                elif target == "deleted":
+                    self.environments = {key: value for key, value in self.environments.items() if key != env_id}
+                    self._next_cookie_sync.pop(env_id, None)
+                    self._observations.pop(env_id, None)
+                    self._process_keys.pop(env_id, None)
+                self._inventory_at = 0
+                return {"environment_id": env_id, "state": target}
 
     def create_shop(self, payload: dict[str, Any]) -> dict[str, Any]:
         # Filesystem work is serialized separately, without keeping HTTP
@@ -361,9 +475,9 @@ class BrowserService:
             with self._state_lock:
                 if self._closed:
                     raise BrowserServiceError("工作台正在关闭", "service_closed")
-                existing = [{"id": env.id, "name": env.name, "user_data_dir": str(env.root),
-                             "download_dir": env.config["download_dir"], "debug_port": env.port,
-                             "config_path": str(env.config_path)} for env in self.environments.values()]
+                existing = [self._environment_resource(env) for env in self.environments.values()]
+                existing.extend({**record["resource"], "deleted": True}
+                                for record in self._lifecycle.values() if record["state"] == "deleted")
             try:
                 record = shop_registry.create_shop(self.registry_path, existing, payload)
                 env = self._load_environment(record["id"], record["store"], "shop", record["browser_config"],
@@ -371,12 +485,12 @@ class BrowserService:
             except shop_registry.ShopRegistryError as exc:
                 raise BrowserServiceError(exc.message, exc.code) from exc
             except (OSError, ValueError, KeyError, TypeError, BrowserControllerError) as exc:
-                raise BrowserServiceError("店铺记录已保存，但环境未能载入，请检查配置后重启工作台", "shop_configuration") from exc
+                raise BrowserServiceError("环境记录已保存，但未能载入，请检查配置后重启工作台", "shop_configuration") from exc
             with self._state_lock:
                 if (env.id in self.environments or any(
                         normalized_path(current.root) == normalized_path(env.root) or current.port == env.port
                         for current in self.environments.values())):
-                    raise BrowserServiceError("新店铺环境与已有环境冲突，未注册到当前服务", "shop_conflict")
+                    raise BrowserServiceError("新环境与已有环境冲突，未注册到当前服务", "shop_conflict")
                 self._auth[env.id] = self._unchecked()
                 self._cookie_sync[env.id] = read_cookie_metadata(env.root)
                 self._next_cookie_sync[env.id] = time.monotonic() + COOKIE_CHECKPOINT_SECONDS
@@ -386,13 +500,45 @@ class BrowserService:
                 # Readers holding the previous mapping can finish safely.
                 self.environments = {**self.environments, env.id: env}
                 self._inventory_at = 0
-            return {"id": env.id, "name": env.name, "kind": env.kind, "login_username": env.login_username,
+            return {"id": env.id, "name": env.name, "kind": "browser", "login_username": env.login_username,
+                    "home_url": env.home_url,
+                    "login_check": self.login_check_settings(env.id),
+                    "login_check_platform": None if env.auth_adapter == "generic" else env.auth_adapter,
                     "user_data_dir": str(env.root), "download_dir": env.config["download_dir"],
                     "debug_port": env.port, "config_path": str(env.config_path)}
 
     @staticmethod
     def _unchecked(message: str = "尚未检查当前登录状态") -> dict[str, Any]:
         return {"status": "unchecked", "checked_at": None, "message": message, "identity": ""}
+
+    def login_check_settings(self, env_id: str) -> dict[str, Any]:
+        with self._state_lock:
+            return deepcopy(self._login_checks.get(env_id, login_settings.DEFAULTS))
+
+    def update_login_check(self, env_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        settings = login_settings.validate_settings(payload)
+        with self._state_lock:
+            if self._closed:
+                raise BrowserServiceError("工作台正在关闭", "service_closed")
+            if not isinstance(env_id, str) or env_id not in self.environments:
+                raise BrowserServiceError("请选择已登记的浏览器环境", "invalid_environment")
+            env = self.environments[env_id]
+            if not self._is_active(env_id):
+                raise BrowserServiceError("环境已归档，请恢复后再修改登录检查", "environment_archived")
+            if (self._pending.get(env_id) or self._maintenance_job_id or self._checkpoint_env == env_id
+                    or profile_busy(env.root)):
+                raise BrowserServiceError("环境仍有任务等待或执行，请完成后再修改登录检查", "environment_busy")
+            if settings["mode"] == "platform" and env.auth_adapter == "generic":
+                raise BrowserServiceError("此主页尚无专用平台检查，请使用通用 URL 检查", "unsupported_login_platform")
+            candidate = {**self._login_checks, env_id: settings}
+            # Publication is atomic. A write failure leaves the previous rule,
+            # visible auth result and maintenance block intact.
+            login_settings.save(self._login_settings_path, candidate)
+            self._login_checks = candidate
+            self._auth[env_id] = self._unchecked("登录检查设置已更新，请重新检查")
+            self._maintenance_required.discard(env_id)
+            self._persist_maintenance()
+            return {"login_check": deepcopy(settings), "auth": deepcopy(self._auth[env_id])}
 
     @staticmethod
     def _process_key(record: dict[str, Any] | None) -> tuple[Any, ...] | None:
@@ -461,6 +607,7 @@ class BrowserService:
         self._refresh()
         with self._state_lock:
             environments = []
+            archived_environments = []
             for env_id, env in self.environments.items():
                 auth = self._auth[env_id]
                 if auth.get("checked_at") and auth["status"] != "unchecked":
@@ -474,9 +621,14 @@ class BrowserService:
                 observed = self._observations.get(env_id, {"running": False, "cdp": "unavailable", "tabs_count": 0, "tabs": []})
                 if self._inventory_error:
                     observed = {**observed, "cdp": "unavailable"}
-                environments.append({
-                    "id": env_id, "name": env.name, "kind": env.kind, **observed,
+                archived = not self._is_active(env_id)
+                row = {
+                    "id": env_id, "name": env.name, "kind": "browser", **observed,
+                    "archived": archived,
                     "login_username": env.login_username,
+                    "home_url": env.home_url,
+                    "login_check": self.login_check_settings(env_id),
+                    "login_check_platform": None if env.auth_adapter == "generic" else env.auth_adapter,
                     "auth": deepcopy(self._auth[env_id]),
                     "cookie_sync": deepcopy(self._cookie_sync[env_id]),
                     "busy": bool(self._pending.get(env_id) or profile_busy(env.root)),
@@ -485,14 +637,21 @@ class BrowserService:
                     "executable_path": env.executable_path, "debug_port": env.port, "cdp_endpoint": env.endpoint,
                     "configured_urls": {role: display_url(value["url"] if isinstance(value, dict) else value)
                                         for role, value in env.config["browser_sessions"].items()},
-                })
+                }
+                if archived:
+                    row["archived_at"] = self._lifecycle[env_id]["changed_at"]
+                    archived_environments.append(row)
+                else:
+                    environments.append(row)
             summary = {"total": len(environments), "running": sum(env["running"] for env in environments),
                        "connected": sum(env["cdp"] == "connected" for env in environments),
                        "verified": sum(env["auth"]["status"] == "verified" for env in environments),
+                       "assumed": sum(env["auth"]["status"] == "assumed" for env in environments),
                        "attention": sum(env["auth"]["status"] in {"required", "error"}
                                         or env["cdp"] in {"unavailable", "conflict"} for env in environments),
                        "busy": sum(env["busy"] for env in environments)}
-            return {"environments": environments, "registry_path": str(self.registry_path),
+            return {"environments": environments, "archived_environments": archived_environments,
+                    "registry_path": str(self.registry_path),
                     "issuer": self.issuer, "updated_at": now(), "activity": deepcopy(self._activity[-50:]),
                     "jobs": deepcopy(self._jobs[-20:]), "summary": summary,
                     "maintenance": deepcopy(self._maintenance),
@@ -504,11 +663,15 @@ class BrowserService:
         if action not in ACTIONS:
             raise BrowserServiceError("不支持的浏览器操作", "invalid_action")
         if (not isinstance(ids, list) or not ids or any(not isinstance(item, str) for item in ids)
-                or len(set(ids)) != len(ids) or set(ids) - self.environments.keys()):
+                or len(set(ids)) != len(ids)):
             raise BrowserServiceError("请选择清单内的浏览器环境，且不要重复选择", "invalid_environment")
         with self._state_lock:
             if self._closed:
                 raise BrowserServiceError("工作台正在关闭", "service_closed")
+            if set(ids) - self.environments.keys():
+                raise BrowserServiceError("请选择仍登记在工作台中的浏览器环境", "invalid_environment")
+            if action not in {"open-folder", "open-results", "close"} and any(not self._is_active(env_id) for env_id in ids):
+                raise BrowserServiceError("归档环境仅可查看目录或关闭浏览器，请恢复后再操作", "environment_archived")
             job = {"id": uuid.uuid4().hex, "action": action, "ids": list(ids), "status": "queued",
                    "created_at": now(), "finished_at": None, "results": []}
             self._jobs.append(job)
@@ -525,18 +688,19 @@ class BrowserService:
             if self._closed:
                 raise BrowserServiceError("工作台正在关闭", "service_closed")
             if self._close_all_job_id:
-                raise BrowserServiceError("已有关闭全部店铺的任务正在等待或执行", "close_all_busy")
+                raise BrowserServiceError("已有关闭全部环境的任务正在等待或执行", "close_all_busy")
+            ids = self._active_ids()
+            if not ids:
+                raise BrowserServiceError("尚未登记浏览器环境，请先新建环境", "no_environments")
             if payload["pause_maintenance"]:
                 self.update_maintenance({"enabled": False,
-                                         "interval_minutes": self._maintenance["interval_minutes"],
-                                         "include_shared": self._maintenance["include_shared"]})
+                                         "interval_minutes": self._maintenance["interval_minutes"]})
             if self._maintenance_job_id:
                 current = next((job for job in self._jobs if job["id"] == self._maintenance_job_id), None)
                 if current is not None:
-                    # Unlike pausing the timer, closing all shops also stops
-                    # a manual round before it can reopen a closed shop.
+                    # Closing all environments also stops a manual round
+                    # before it can reopen an already closed browser.
                     current["stop_requested"] = True
-            ids = [env.id for env in self.environments.values() if env.kind == "shop"]
             result = self.submit("close", ids)
             self._jobs[-1]["close_all"] = True
             self._close_all_job_id = result["id"]
@@ -557,7 +721,7 @@ class BrowserService:
         try:
             settings = maintenance_state.validate_settings(payload)
         except ValueError as exc:
-            raise BrowserServiceError("维护设置无效，请完整填写开关、间隔及是否包含票聚", "invalid_maintenance") from exc
+            raise BrowserServiceError("维护设置无效，请完整填写开关和间隔", "invalid_maintenance") from exc
         with self._state_lock:
             if self._closed:
                 raise BrowserServiceError("工作台正在关闭", "service_closed")
@@ -595,11 +759,10 @@ class BrowserService:
             if self._maintenance_job_id:
                 raise BrowserServiceError("已有一轮会话维护正在等待或执行", "maintenance_busy")
             if self._close_all_job_id:
-                raise BrowserServiceError("正在关闭全部店铺，请完成后再运行维护", "maintenance_busy")
-            ids = [key for key, env in self.environments.items()
-                   if env.kind == "shop" or self._maintenance["include_shared"]]
-            # Shops first; the optional shared environment follows them.
-            ids.sort(key=lambda key: self.environments[key].kind == "shared")
+                raise BrowserServiceError("正在关闭全部环境，请完成后再运行维护", "maintenance_busy")
+            ids = self._active_ids()
+            if not ids:
+                raise BrowserServiceError("尚未登记浏览器环境，请先新建环境", "no_environments")
             job = {"id": uuid.uuid4().hex, "action": "maintain-session", "ids": ids, "status": "queued",
                    "created_at": now(), "finished_at": None, "results": [],
                    "trigger": "scheduled" if scheduled else "manual", "stop_requested": False}
@@ -621,7 +784,7 @@ class BrowserService:
     def _maintenance_tick(self) -> None:
         # Clock checks run in the server worker, independent of HTTP polling.
         with self._state_lock:
-            if (self._closed or self._maintenance_job_id or self._close_all_job_id or not self._maintenance["enabled"]
+            if (self._closed or not self._active_ids() or self._maintenance_job_id or self._close_all_job_id or not self._maintenance["enabled"]
                     or not self._queue.empty() or time.monotonic() < self._maintenance_retry_after):
                 return
             due = self._maintenance["next_run_at"]
@@ -653,6 +816,9 @@ class BrowserService:
         for env_id in current_ids:
             env = self.environments[env_id]
             with self._state_lock:
+                # Shutdown can arrive between choosing the next environment
+                # and admitting it here. Only an already admitted one runs.
+                paused = paused or self._closed or job["stop_requested"]
                 self._pending[env_id] = self._pending.get(env_id, 0) + 1
                 self._maintenance_active_env = env_id
             try:
@@ -669,12 +835,11 @@ class BrowserService:
                         with self._state_lock:
                             self._maintenance_required.add(env_id)
                         result = {"status": "skipped", "code": "login_required", "message": "需要人工登录，后续定时轮次将跳过此环境"}
-                    elif auth.get("status") != "verified":
+                    elif auth.get("status") not in {"verified", "assumed"}:
                         result = {"status": "failed", "code": "login_check_failed", "message": value.get("message", "登录检查未完成")}
                     else:
                         result = {"status": "complete", "message": value.get("message", "已访问后台并保存会话")}
-                        if job["trigger"] == "manual":
-                            self._clear_maintenance_login_block(env_id)
+                        self._clear_maintenance_login_block(env_id)
             except Exception as exc:
                 error = self._friendly_error(exc)
                 result = {"status": "skipped" if error.code in {"profile_locked", "login_required"} else "failed",
@@ -814,19 +979,28 @@ class BrowserService:
             return
         current = time.monotonic()
         with self._state_lock:
-            due = sorted((due_at, key) for key, due_at in self._next_cookie_sync.items() if due_at <= current)
+            due = sorted((due_at, key) for key, due_at in self._next_cookie_sync.items()
+                         if due_at <= current and self._is_active(key))
         if not due:
             return
         self._refresh()
         _, env_id = due[0]
-        self._next_cookie_sync[env_id] = current + COOKIE_CHECKPOINT_SECONDS
-        env = self.environments[env_id]
+        with self._state_lock:
+            if not self._is_active(env_id):
+                return
+            self._next_cookie_sync[env_id] = current + COOKIE_CHECKPOINT_SECONDS
+            env = self.environments[env_id]
+        if profile_busy(env.root):
+            return
         with self._state_lock:
             observed = self._observations.get(env_id, {})
             ready = (not self._inventory_error and observed.get("cdp") == "connected"
                      and not self._pending.get(env_id))
-        if not ready or self._closed or not self._queue.empty() or profile_busy(env.root):
-            return
+            # Admit this checkpoint atomically with shutdown. Once admitted,
+            # it finishes with the worker before the service can exit.
+            if not ready or self._closed or not self._queue.empty() or not self._is_active(env_id):
+                return
+            self._checkpoint_env = env_id
         try:
             asyncio.run(self._browser_action("save-session", env, automatic=True))
         except Exception as exc:
@@ -837,6 +1011,9 @@ class BrowserService:
                                        "name": env.name, "action": "save-session", "level": "error",
                                        "message": "会话自动保存未完成，可在环境详情中重试保存"})
                 self._activity = self._activity[-50:]
+        finally:
+            with self._state_lock:
+                self._checkpoint_env = None
 
     @staticmethod
     def _friendly_error(exc: Exception) -> BrowserServiceError:
@@ -868,45 +1045,63 @@ class BrowserService:
         if action == "maintain-session":
             async def bounded_maintenance() -> dict[str, Any]:
                 try:
-                    return await asyncio.wait_for(self._maintain_browser(env), timeout=55)
+                    budget = 90 + self.login_check_settings(env.id)["wait_seconds"]
+                    return await asyncio.wait_for(self._maintain_browser(env), timeout=budget)
                 except asyncio.TimeoutError as exc:
+                    self._set_auth(env.id, "error", "本环境维护超时，未能判断登录状态")
                     raise BrowserServiceError("本环境维护超时，保留浏览器并继续其他环境", "maintenance_timeout") from exc
             return asyncio.run(bounded_maintenance())
         return asyncio.run(self._browser_action(action, env))
 
     async def _maintain_browser(self, env: Environment) -> dict[str, Any]:
-        """Visit exactly one workbench page; never focus or close its window."""
-        controller = PlaywrightBrowserController(env.config, timeout_ms=15000)
+        return await self._run_login_check(env, allow_launch=True)
+
+    async def _run_login_check(self, env: Environment, *, allow_launch: bool) -> dict[str, Any]:
+        """One navigation/check/save path for opening, checking and maintenance."""
+        self._set_auth(env.id, "unchecked", "正在访问主页并检查登录")
+        if not allow_launch:
+            try:
+                self._require_owner(env)
+            except BrowserServiceError as exc:
+                if exc.code == "browser_stopped":
+                    auth = self._set_auth(env.id, "unchecked", "浏览器未运行，未检查登录")
+                    return {"message": auth["message"], "auth": auth}
+                self._set_auth(env.id, "error", self._friendly_error(exc).message)
+                raise
+        controller = PlaywrightBrowserController(env.config, timeout_ms=15000, login_probe_mode=True)
         try:
-            await controller.start(open_missing=True)
+            if allow_launch:
+                await controller.start(open_missing=False)
+            else:
+                await controller.connect(open_missing=False)
             fingerprint = self._process_key(self._require_owner(env))
             self._adopt_process(env.id, fingerprint)
-            role = "goods" if env.kind == "shared" else "home"
-            page = controller.page(role)
-            registration = controller.registrations[role]
-            # A launch or missing-page recovery already visited the URL.
-            # Existing pages receive one navigation to their fixed main URL.
-            if not controller._browser_owned and not registration.created:
-                value = env.config["browser_sessions"][role]
-                target = value["url"] if isinstance(value, dict) else value
-                try:
-                    await page.goto(target, wait_until="domcontentloaded", timeout=15000)
-                except Exception as exc:
-                    if not _url_is_login(page.url):
-                        raise BrowserServiceError("后台页面访问未完成，保留浏览器并继续其他环境", "page_navigation_failed") from exc
-            auth = await self._check_auth(env, page)
+            previous = self._probe_targets.get(env.id, {})
+            if previous.get("fingerprint") != fingerprint:
+                previous = {}
+            page, target_id = await controller.probe_page(
+                env.home_role, previous_target_id=previous.get("target_id"), previous_url=previous.get("url"),
+            )
+            try:
+                auth = await self._check_auth(env, page)
+            finally:
+                self._probe_targets[env.id] = {"fingerprint": fingerprint, "target_id": target_id, "url": str(page.url)}
             self._require_owner(env, expected=fingerprint)
             result = {"message": auth["message"], "auth": auth}
-            if auth["status"] == "verified":
+            if auth["status"] == "error":
+                result.update(status="failed", code="login_check_failed")
+            if auth["status"] in {"verified", "assumed"}:
                 saved = await self._save_session(env, controller.browser)
                 self._require_saved(saved)
-                result.update(message="已访问后台、确认登录并保存会话", cookie_sync=saved)
+                self._clear_maintenance_login_block(env.id)
+                result.update(message=auth["message"] + "；会话已保存", cookie_sync=saved)
             return result
-        except BrowserControllerError as exc:
-            if exc.code == "login_required":
-                self._adopt_process(env.id, self._process_key(self._require_owner(env)))
-                auth = self._set_auth(env.id, "required", "需要在浏览器中完成人工登录")
-                return {"message": auth["message"], "auth": auth}
+        except asyncio.CancelledError:
+            self._set_auth(env.id, "error", "本次检查被取消或超时，未能判断登录状态")
+            raise
+        except Exception as exc:
+            if getattr(exc, "code", "") != "cookie_sync_failed":
+                self._set_auth(env.id, "error", self._friendly_error(exc).message)
             raise
         finally:
             await controller.close()
@@ -965,40 +1160,8 @@ class BrowserService:
             raise BrowserServiceError(result["message"], "cookie_sync_failed")
 
     async def _browser_action(self, action: str, env: Environment, *, automatic: bool = False) -> dict[str, Any]:
-        if action == "start":
-            controller = PlaywrightBrowserController(env.config, timeout_ms=15000)
-            try:
-                await controller.start(open_missing=True)
-                record = self._require_owner(env)
-                fingerprint = self._process_key(record)
-                self._adopt_process(env.id, fingerprint)
-                page = self._business_page(env, controller.context.pages)
-                auth = await self._check_auth(env, page)
-                self._require_owner(env, expected=fingerprint)
-                result = {"message": "浏览器已就绪，已复用业务页面；" + auth["message"], "auth": auth}
-                if auth["status"] == "verified":
-                    self._clear_maintenance_login_block(env.id)
-                    result["cookie_sync"] = await self._save_session(env, controller.browser)
-                    self._require_saved(result["cookie_sync"])
-                return result
-            except BrowserControllerError as exc:
-                if exc.code == "login_required":
-                    self._adopt_process(env.id, self._process_key(self._require_owner(env)))
-                    self._set_auth(env.id, "required", "需要在浏览器中完成人工登录")
-                    return {"message": "浏览器已打开，请完成人工登录"}
-                if exc.code == "page_missing":
-                    try:
-                        self._require_owner(env)
-                    except BrowserServiceError as ownership_error:
-                        if ownership_error.code == "browser_stopped":
-                            self._set_auth(env.id, "unchecked", "浏览器已退出，请重新打开此环境")
-                            raise BrowserServiceError("浏览器已退出，请重新打开此环境", "browser_stopped") from exc
-                        raise
-                    self._set_auth(env.id, "unchecked", "业务页面尚未就绪，请等待加载后点击检查登录")
-                    raise BrowserServiceError("浏览器页面尚未就绪，请等待加载后点击检查登录", "page_missing") from exc
-                raise
-            finally:
-                await controller.close()
+        if action in {"start", "check-login"}:
+            return await self._run_login_check(env, allow_launch=action == "start")
 
         lock = ProfileLock(env.root, env.config["profile_directory"])
         lock.acquire()
@@ -1040,20 +1203,6 @@ class BrowserService:
                     await self._wait_for_exit(fingerprint)
                     self._set_auth(env.id, "unchecked", "浏览器已关闭，登录状态将在下次启动后检查")
                     return {"message": "会话已保存，此浏览器环境已正常关闭", "cookie_sync": saved}
-                contexts = list(browser.contexts)
-                if not contexts:
-                    raise BrowserServiceError("浏览器没有可用页面环境", "context_missing")
-                page = self._business_page(env, contexts[0].pages)
-                if action == "check-login":
-                    self._adopt_process(env.id, fingerprint)
-                    auth = await self._check_auth(env, page)
-                    self._require_owner(env, expected=fingerprint)
-                    result = {"message": auth["message"], "auth": auth}
-                    if auth["status"] == "verified":
-                        self._clear_maintenance_login_block(env.id)
-                        result["cookie_sync"] = await self._save_session(env, browser)
-                        self._require_saved(result["cookie_sync"])
-                    return result
                 raise BrowserServiceError("不支持的浏览器操作", "invalid_action")
             finally:
                 await self._detach(runtime, browser)
@@ -1109,12 +1258,12 @@ class BrowserService:
     @staticmethod
     def _business_page(env: Environment, pages: list[Any]) -> Any:
         roles = env.config["browser_sessions"]
-        preferred = "goods" if env.kind == "shared" else "home"
+        preferred = env.home_role
         value = roles[preferred]
         expected_url = value["url"] if isinstance(value, dict) else value
         open_pages = [page for page in pages if not page.is_closed()]
         page = next((page for page in open_pages if _same_role_page(page.url, expected_url)), None)
-        if page is None:
+        if page is None and env.auth_adapter != "generic":
             page = next((page for page in open_pages if _url_is_login(page.url)
                          and _same_site_family(page.url, expected_url)), None)
         if page is None:
@@ -1125,10 +1274,21 @@ class BrowserService:
         return page
 
     async def _check_auth(self, env: Environment, page: Any) -> dict[str, Any]:
+        settings = self.login_check_settings(env.id)
+        value = await probe_login_url(page, env.home_url, settings)
+        if settings["mode"] == "url" or value["status"] != "assumed":
+            return self._set_auth(env.id, value["status"], value["message"])
+        if env.auth_adapter == "generic":
+            return self._set_auth(env.id, "error", "此主页没有专用平台检查，请改用通用 URL 检查")
+        return await self._platform_auth(env, page)
+
+    async def _platform_auth(self, env: Environment, page: Any) -> dict[str, Any]:
+        if env.auth_adapter == "generic":
+            return self._set_auth(env.id, "unchecked", "此网站暂不支持自动判断登录状态，请在浏览器中自行确认")
         if _url_is_login(page.url):
             return self._set_auth(env.id, "required", "需要在浏览器中完成人工登录")
         try:
-            if env.kind == "shop":
+            if env.auth_adapter == "qianniu":
                 value = await asyncio.wait_for(page.evaluate((VENDOR / "check_qianniu.js").read_text(encoding="utf-8")), timeout=15)
                 actual = str(value.get("store") or "").strip()
                 if value.get("required"):
@@ -1171,10 +1331,16 @@ class BrowserService:
             return self._set_auth(env.id, "error", "登录检查未完成，请确认业务页面已加载后重试")
 
     def shutdown(self, *, wait: bool = True) -> None:
+        """Stop admitting work and drain accepted actions without closing browsers."""
         with self._state_lock:
-            if self._closed:
-                return
-            self._closed = True
-            self._queue.put(None)
+            if not self._closed:
+                self._closed = True
+                self._queue.put(None)
         if wait:
-            self._worker.join(timeout=20)
+            if threading.current_thread() is self._worker:
+                raise RuntimeError("The browser worker cannot wait for itself")
+            self._worker.join()
+            # A shop creation may already be writing its files outside the
+            # state lock. Let that accepted operation finish before exit.
+            with self._creation_lock:
+                pass

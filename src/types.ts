@@ -1,12 +1,25 @@
 export type Action = 'start' | 'focus' | 'check-login' | 'save-session' | 'maintain-session' | 'close' | 'open-folder' | 'open-results';
-export type AuthStatus = 'verified' | 'required' | 'unchecked' | 'error';
+export type AuthStatus = 'verified' | 'assumed' | 'required' | 'unchecked' | 'error';
 export type JobStatus = 'queued' | 'running' | 'complete' | 'partial' | 'failed';
+export type ShutdownStatus = 'running' | 'requesting' | 'stopping' | 'stopped';
+export type RegistrationAction = 'archive' | 'restore' | 'delete';
+export type RegistrationState = 'active' | 'archived' | 'deleted';
+
+export interface LoginCheckSettings {
+  mode: 'url' | 'platform';
+  login_url: string;
+  wait_seconds: number;
+}
 
 export interface Environment {
   id: string;
   name: string;
-  kind: 'shop' | 'shared';
+  kind: 'browser' | 'shop' | 'shared';
   login_username?: string;
+  home_url?: string;
+  login_check?: LoginCheckSettings;
+  login_check_platform?: 'qianniu' | 'jst' | null;
+  archived_at?: string | null;
   running: boolean;
   cdp: 'connected' | 'unavailable' | 'stopped' | 'conflict';
   auth: { status: AuthStatus; checked_at?: string | null; message?: string; identity?: string | Record<string, unknown> | null };
@@ -45,6 +58,7 @@ export interface Job {
 
 export interface CreateShopInput {
   name: string;
+  home_url: string;
   parent_folder: string;
   login_username: string;
 }
@@ -52,6 +66,7 @@ export interface CreateShopInput {
 export interface CreatedShop {
   id: string;
   name: string;
+  home_url?: string;
   user_data_dir: string;
   debug_port: number;
   config_path: string;
@@ -71,7 +86,6 @@ export interface Activity {
 export interface MaintenanceSettings {
   enabled: boolean;
   interval_minutes: number;
-  include_shared: boolean;
 }
 
 export interface Maintenance extends MaintenanceSettings {
@@ -86,7 +100,9 @@ export interface Maintenance extends MaintenanceSettings {
 
 export interface WorkbenchState {
   csrf_token: string;
+  service_status?: 'running' | 'stopping';
   environments: Environment[];
+  archived_environments?: Environment[];
   registry_path: string;
   issuer: string;
   updated_at: string;

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "shops": [
+    {
+      "id": "example",
+      "store": "示例浏览器",
+      "login_username": "",
+      "browser_config": "browser.json"
+    }
+  ]
+}

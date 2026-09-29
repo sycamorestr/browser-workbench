@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "browser": "Edge",
+  "user_data_dir": "profiles/example",
+  "profile_directory": "Default",
+  "remote_debugging_port": 19223,
+  "download_dir": "downloads/example",
+  "browser_sessions": {
+    "home": {
+      "url": "https://example.com/"
+    }
+  }
+}

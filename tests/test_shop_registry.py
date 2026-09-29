@@ -10,10 +10,12 @@ from unittest.mock import patch
 
 from backend import shop_registry as registry
 
+HOME_URL = "https://console.example.test/admin?workspace=one#overview"
+
 
 def create_in_process(registry_path, folder, name, queue):
     try:
-        value = registry.create_shop(Path(registry_path), [], {"name": name, "parent_folder": folder})
+        value = registry.create_shop(Path(registry_path), [], {"name": name, "parent_folder": folder, "home_url": HOME_URL})
         queue.put({"ok": True, "record": value})
     except Exception as exc:
         queue.put({"ok": False, "error": str(exc)})
@@ -35,7 +37,7 @@ class ShopRegistryTests(unittest.TestCase):
 
     def create(self, name="新增店铺", **overrides):
         return registry.create_shop(self.source, [], {
-            "name": name, "parent_folder": str(self.parent), **overrides,
+            "name": name, "parent_folder": str(self.parent), "home_url": HOME_URL, **overrides,
         })
 
     def config(self, record):
@@ -56,7 +58,7 @@ class ShopRegistryTests(unittest.TestCase):
             self.assertRegex(record["id"], r"^shop-[0-9a-f]{8}$")
             self.assertEqual(config["browser"], "Edge")
             self.assertEqual(config["profile_directory"], "Default")
-            self.assertEqual(config["browser_sessions"], {"home": {"url": registry.HOME_URL}})
+            self.assertEqual(config["browser_sessions"], {"home": {"url": HOME_URL}})
             self.assertGreaterEqual(config["remote_debugging_port"], 9401)
         self.assertEqual(registry.load_custom_shops(self.source), [first, second])
         self.assertEqual(self.source.read_bytes(), self.original)
@@ -69,6 +71,7 @@ class ShopRegistryTests(unittest.TestCase):
             ({"name": "a\nb"}, "invalid_shop_name"),
             ({"login_username": "u" * 161}, "invalid_login_username"),
             ({"password": "never-persist"}, "invalid_shop"),
+            ({"home_url": ""}, "invalid_home_url"),
             ({"parent_folder": "relative"}, "invalid_parent_folder"),
             ({"parent_folder": "C:relative"}, "invalid_parent_folder"),
             ({"parent_folder": r"\\server\share"}, "invalid_parent_folder"),
@@ -94,8 +97,30 @@ class ShopRegistryTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "duplicate_shop_name")
         with self.assertRaises(registry.ShopRegistryError) as error:
             registry.create_shop(self.source, [{"id": "shop01", "name": "原店铺"}],
-                                 {"name": "原店铺", "parent_folder": str(self.parent)})
+                                 {"name": "原店铺", "parent_folder": str(self.parent), "home_url": HOME_URL})
         self.assertEqual(error.exception.code, "duplicate_shop_name")
+
+    def test_deleted_registration_releases_name_but_reserves_directory_and_port(self):
+        original = self.create("填错的环境")
+        config = self.config(original)
+        sentinel = Path(config["user_data_dir"]) / "login-data"
+        sentinel.write_bytes(b"keep login data")
+        reservation = {"id": original["id"], "name": original["store"], "deleted": True,
+                       "user_data_dir": config["user_data_dir"], "download_dir": config["download_dir"],
+                       "debug_port": config["remote_debugging_port"], "config_path": original["browser_config"]}
+        replacement = registry.create_shop(self.source, [reservation], {"name": original["store"],
+                    "parent_folder": str(self.parent), "home_url": HOME_URL})
+        self.assertNotEqual(replacement["id"], original["id"])
+        self.assertNotEqual(self.config(replacement)["remote_debugging_port"], config["remote_debugging_port"])
+        self.assertEqual(sentinel.read_bytes(), b"keep login data")
+        self.assertEqual(len(registry.load_custom_shops(self.source, retired_ids={original["id"]})), 2)
+        # Files retained by deletion may subsequently be removed by their owner.
+        # Creation must still reserve the old resources without reading them.
+        Path(original["browser_config"]).unlink()
+        third = registry.create_shop(self.source, [reservation], {"name": "另一个新环境",
+                    "parent_folder": str(self.parent), "home_url": HOME_URL})
+        self.assertNotEqual(self.config(third)["remote_debugging_port"], config["remote_debugging_port"])
+        self.assertEqual(self.source.read_bytes(), self.original)
 
     def test_protected_profile_and_download_subtrees_rejected_but_ancestor_parent_allowed(self):
         profile, downloads = self.parent / "old-profile", self.parent / "old-downloads"
@@ -106,12 +131,37 @@ class ShopRegistryTests(unittest.TestCase):
                      "download_dir": str(downloads), "debug_port": 9401}]
         for parent in (profile, nested, downloads):
             with self.assertRaises(registry.ShopRegistryError) as error:
-                registry.create_shop(self.source, existing, {"name": "新店铺", "parent_folder": str(parent)})
+                registry.create_shop(self.source, existing, {"name": "新店铺", "parent_folder": str(parent), "home_url": HOME_URL})
             self.assertEqual(error.exception.code, "folder_conflict")
-        record = registry.create_shop(self.source, existing, {"name": "新店铺", "parent_folder": str(self.parent)})
+        record = registry.create_shop(self.source, existing, {"name": "新店铺", "parent_folder": str(self.parent), "home_url": HOME_URL})
         self.assertNotEqual(self.config(record)["remote_debugging_port"], 9401)
         self.assertTrue(profile.is_dir())
         self.assertTrue(downloads.is_dir())
+
+    def test_homepage_is_required_and_invalid_addresses_leave_no_files(self):
+        missing = {"name": "Missing homepage", "parent_folder": str(self.parent)}
+        with self.assertRaises(registry.ShopRegistryError) as error:
+            registry.create_shop(self.source, [], missing)
+        self.assertEqual(error.exception.code, "invalid_home_url")
+        for url in (None, "", "   ", "example.test", "//example.test", "http:///missing",
+                    "javascript:alert(1)", "file:///C:/private", "ftp://example.test/", "https://user:secret@example.test/",
+                    "https://@example.test/", "https://example.test:0/", "http://example.test:65536/",
+                    "http://[::1", "https://example.test/a b", "https://example.test/\n", "https://example.test/\x85",
+                    "https://example.test\\other", "https://example.test/" + "a" * 4096):
+            with self.subTest(url=url), self.assertRaises(registry.ShopRegistryError) as error:
+                self.create(home_url=url)
+            self.assertEqual(error.exception.code, "invalid_home_url")
+            self.assertFalse(self.manifest.exists())
+            self.assertEqual(list(self.parent.iterdir()), [])
+
+    def test_homepage_preserves_user_path_query_fragment_and_supports_local_urls(self):
+        for index, url in enumerate(("http://127.0.0.1:18765/admin?shop=a&next=%2Fhome#workspace",
+                                    "http://intranet/dashboard", "http://[::1]:18765/login?team=b#login",
+                                    "https://console.example.test/path/%E4%B8%AD?q=a%20b#section")):
+            with self.subTest(url=url):
+                record = self.create(name=f"Custom {index}", home_url="  " + url + "  ")
+                self.assertEqual(self.config(record)["browser_sessions"]["home"]["url"], url)
+        self.assertEqual(self.source.read_bytes(), self.original)
 
     def test_live_listener_port_is_excluded(self):
         port, listener = registry._reserve_debug_port(set())

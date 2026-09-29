@@ -16,9 +16,9 @@ if (-not $NoShortcut) {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut((Join-Path $desktopRoot '浏览器工作台.lnk'))
     $shortcut.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSScriptRoot + '\Start-Workbench.ps1"'
+    $shortcut.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSScriptRoot + '\Start-Workbench.ps1" -SettingsPath "' + (Join-Path $runtimeRoot 'settings.json') + '"'
     $shortcut.WorkingDirectory = $PSScriptRoot
-    $shortcut.Description = '管理店铺浏览器、登录状态与 Playwright CDP 连接'
+    $shortcut.Description = '管理独立浏览器环境、登录状态与 Playwright CDP 连接'
     $shortcut.IconLocation = "$env:SystemRoot\System32\shell32.dll,20"
     $shortcut.Save()
 }

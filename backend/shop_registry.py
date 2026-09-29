@@ -11,13 +11,13 @@ import time
 import unicodedata
 import uuid
 from typing import Any
+from urllib.parse import urlsplit
 
 from .vendor.browser_lock import FileMutex, FileMutexBusy
 
 
 MANIFEST_NAME = ".browser-workbench-shops.json"
 LOCK_NAME = ".browser-workbench-shops.lock"
-HOME_URL = "https://myseller.taobao.com/"
 FIRST_PORT = 9401
 LOCK_WAIT_SECONDS = 5.0
 _RESERVED = re.compile(r"^(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\..*)?$", re.I)
@@ -61,49 +61,72 @@ def _read_document(path: Path) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError) as exc:
-        raise ShopRegistryError("invalid_custom_registry", "自定义店铺登记文件无法读取，请检查本地文件") from exc
+        raise ShopRegistryError("invalid_custom_registry", "自定义环境登记文件无法读取，请检查本地文件") from exc
     if not isinstance(document, dict) or document.get("schema_version") != 1 or not isinstance(document.get("shops"), list):
-        raise ShopRegistryError("invalid_custom_registry", "自定义店铺登记文件格式不正确")
+        raise ShopRegistryError("invalid_custom_registry", "自定义环境登记文件格式不正确")
     return document
 
 
-def _records(document: dict[str, Any], base: Path) -> list[dict[str, Any]]:
+def _records(document: dict[str, Any], base: Path, retired_ids: set[str] | None = None) -> list[dict[str, Any]]:
     result = []
     ids, names, configs = set(), set(), set()
     for item in document["shops"]:
         if not isinstance(item, dict) or not all(isinstance(item.get(key), str) and item[key].strip() for key in ("id", "store", "browser_config")):
-            raise ShopRegistryError("invalid_custom_registry", "自定义店铺记录缺少有效的名称、标识或配置路径")
+            raise ShopRegistryError("invalid_custom_registry", "自定义环境记录缺少有效的名称、标识或配置路径")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", item["id"]) or len(item["store"].strip()) > 80:
-            raise ShopRegistryError("invalid_custom_registry", "自定义店铺名称或标识格式不正确")
+            raise ShopRegistryError("invalid_custom_registry", "自定义环境名称或标识格式不正确")
         username = item.get("login_username", "")
         if not isinstance(username, str) or len(username) > 160:
-            raise ShopRegistryError("invalid_custom_registry", "自定义店铺登录用户名格式不正确")
+            raise ShopRegistryError("invalid_custom_registry", "自定义环境登录用户名格式不正确")
         config = _resolve_path(item["browser_config"], base)
         keys = (item["id"].casefold(), _name_key(item["store"]), _path_key(config))
-        if keys[0] in ids or keys[1] in names or keys[2] in configs:
-            raise ShopRegistryError("invalid_custom_registry", "自定义店铺登记文件存在重复记录")
-        ids.add(keys[0]); names.add(keys[1]); configs.add(keys[2])
+        retired = item["id"] in (retired_ids or set())
+        if keys[0] in ids or (not retired and keys[1] in names) or keys[2] in configs:
+            raise ShopRegistryError("invalid_custom_registry", "自定义环境登记文件存在重复记录")
+        ids.add(keys[0]); configs.add(keys[2])
+        if not retired:
+            names.add(keys[1])
         result.append({"id": item["id"], "store": item["store"], "login_username": username,
                        "browser_config": str(config)})
     return result
 
 
-def load_custom_shops(registry_path: Path) -> list[dict[str, Any]]:
+def load_custom_shops(registry_path: Path, *, retired_ids: set[str] | None = None) -> list[dict[str, Any]]:
     """Read the sidecar manifest; relative config paths use registry.parent."""
     path = _manifest_path(registry_path)
-    return _records(_read_document(path), path.parent)
+    return _records(_read_document(path), path.parent, retired_ids)
 
 
-def _validate_payload(payload: dict[str, Any]) -> tuple[str, str, Path]:
-    if not isinstance(payload, dict) or set(payload) - {"name", "parent_folder", "login_username"}:
-        raise ShopRegistryError("invalid_shop", "新建店铺只接受名称、父文件夹和登录用户名")
+def validate_home_url(value: Any) -> str:
+    message = "请填写有效的 HTTP 或 HTTPS 主页地址，不包含账号密码、空白或控制字符"
+    if not isinstance(value, str) or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+        raise ShopRegistryError("invalid_home_url", message)
+    url = value.strip()
+    if not url or len(url) > 4096 or "\\" in url or any(char.isspace() for char in url):
+        raise ShopRegistryError("invalid_home_url", message)
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or (parsed.port is not None and not 1 <= parsed.port <= 65535)
+                or any(char in parsed.hostname for char in '<>"{}|^`')):
+            raise ValueError("invalid homepage")
+    except ValueError as exc:
+        raise ShopRegistryError("invalid_home_url", message) from exc
+    return url
+
+
+def _validate_payload(payload: dict[str, Any]) -> tuple[str, str, Path, str]:
+    if not isinstance(payload, dict) or set(payload) - {"name", "parent_folder", "login_username", "home_url"}:
+        raise ShopRegistryError("invalid_shop", "新建环境只接受名称、主页地址、父文件夹和登录用户名")
     name = payload.get("name")
     username = payload.get("login_username", "")
     folder = payload.get("parent_folder")
     if not isinstance(name, str) or not name.strip() or len(name.strip()) > 80 or any(ord(c) < 32 for c in name):
-        raise ShopRegistryError("invalid_shop_name", "店铺名称不能为空，且不能超过 80 个字符或包含控制字符")
+        raise ShopRegistryError("invalid_shop_name", "环境名称不能为空，且不能超过 80 个字符或包含控制字符")
     if not isinstance(username, str) or len(username.strip()) > 160 or any(ord(c) < 32 for c in username):
         raise ShopRegistryError("invalid_login_username", "登录用户名不能超过 160 个字符或包含控制字符")
+    home_url = validate_home_url(payload.get("home_url"))
     if not isinstance(folder, str) or not folder or any(ord(c) < 32 for c in folder):
         raise ShopRegistryError("invalid_parent_folder", "请选择本机已有的绝对路径文件夹")
     windows = PureWindowsPath(folder)
@@ -133,7 +156,7 @@ def _validate_payload(payload: dict[str, Any]) -> tuple[str, str, Path]:
         import ctypes
         if ctypes.windll.kernel32.GetDriveTypeW(str(parent.anchor)) == 4:
             raise ShopRegistryError("invalid_parent_folder", "请选择本机磁盘，不支持映射的网络驱动器")
-    return name.strip(), username.strip(), parent
+    return name.strip(), username.strip(), parent, home_url
 
 
 def _custom_resources(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -203,10 +226,10 @@ def _atomic_write_json(path: Path, value: Any, *, replace_existing: bool = True)
 
 def create_shop(registry_path: Path, existing: list[dict[str, Any]], payload: dict[str, Any]) -> dict[str, Any]:
     """Create one fresh profile and append it under a cross-process lock."""
-    name, username, parent = _validate_payload(payload)
+    name, username, parent, home_url = _validate_payload(payload)
     manifest = _manifest_path(registry_path)
     if not manifest.parent.is_dir():
-        raise ShopRegistryError("invalid_custom_registry", "原店铺登记文件所在目录不存在")
+        raise ShopRegistryError("invalid_custom_registry", "原环境登记文件所在目录不存在")
     mutex = FileMutex(manifest.parent / LOCK_NAME)
     deadline = time.monotonic() + LOCK_WAIT_SECONDS
     while True:
@@ -215,19 +238,23 @@ def create_shop(registry_path: Path, existing: list[dict[str, Any]], payload: di
             break
         except FileMutexBusy as exc:
             if time.monotonic() >= deadline:
-                raise ShopRegistryError("registry_busy", "其他进程正在创建店铺环境，请稍后重试") from exc
+                raise ShopRegistryError("registry_busy", "其他进程正在创建环境，请稍后重试") from exc
             time.sleep(0.05)
         except OSError as exc:
-            raise ShopRegistryError("registry_write_failed", "无法锁定自定义店铺登记文件") from exc
+            raise ShopRegistryError("registry_write_failed", "无法锁定自定义环境登记文件") from exc
     created_dirs: list[Path] = []
     reservation = None
     committed = False
     try:
         document = _read_document(manifest)
-        records = _records(document, manifest.parent)
-        resources = list(existing) + _custom_resources(records)
-        if any(_name_key(str(item.get("name", item.get("store", "")))) == _name_key(name) for item in resources):
-            raise ShopRegistryError("duplicate_shop_name", "该店铺名称已存在，请使用不同名称")
+        retired_ids = {str(item.get("id", "")) for item in existing if item.get("deleted") is True}
+        records = _records(document, manifest.parent, retired_ids)
+        # Deleted registrations keep their directory and port reservations.
+        # Their files may later be cleaned up manually, so never reload those
+        # browser configs just to create an unrelated replacement environment.
+        resources = list(existing) + _custom_resources([record for record in records if record["id"] not in retired_ids])
+        if any(not item.get("deleted") and _name_key(str(item.get("name", item.get("store", "")))) == _name_key(name) for item in resources):
+            raise ShopRegistryError("duplicate_shop_name", "该环境名称已存在，请使用不同名称")
         ids = {str(item.get("id", "")).casefold() for item in resources}
         protected = [Path(str(item[key])).resolve() for item in resources for key in ("user_data_dir", "download_dir") if item.get(key)]
         existing_configs = {_path_key(Path(str(item["config_path"]))) for item in resources if item.get("config_path")}
@@ -260,7 +287,7 @@ def create_shop(registry_path: Path, existing: list[dict[str, Any]], payload: di
         config_path = root / "browser.json"
         config = {"schema_version": 1, "browser": "Edge", "user_data_dir": str(profile),
                   "profile_directory": "Default", "remote_debugging_port": port,
-                  "download_dir": str(downloads), "browser_sessions": {"home": {"url": HOME_URL}}}
+                  "download_dir": str(downloads), "browser_sessions": {"home": {"url": home_url}}}
         _atomic_write_json(config_path, config, replace_existing=False)
         record = {"id": env_id, "store": name, "login_username": username,
                   "browser_config": str(config_path)}
@@ -271,7 +298,7 @@ def create_shop(registry_path: Path, existing: list[dict[str, Any]], payload: di
     except ShopRegistryError:
         raise
     except (OSError, ValueError, TypeError) as exc:
-        raise ShopRegistryError("registry_write_failed", "新环境创建失败；已登记的店铺保持不变") from exc
+        raise ShopRegistryError("registry_write_failed", "新环境创建失败；已登记的环境保持不变") from exc
     finally:
         if reservation is not None:
             reservation.close()

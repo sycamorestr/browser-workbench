@@ -22,10 +22,14 @@ class MaintenanceTests(unittest.TestCase):
     setUp = fixtures.BrowserServiceTests.setUp
     tearDown = fixtures.BrowserServiceTests.tearDown
     process = fixtures.BrowserServiceTests.process
+    generic_environment = fixtures.BrowserServiceTests.generic_environment
+    probe_controller = staticmethod(fixtures.BrowserServiceTests.probe_controller)
 
-    def settings(self, *, enabled=False, include_shared=False, interval=120):
-        return self.service.update_maintenance({"enabled": enabled, "include_shared": include_shared,
-                                                "interval_minutes": interval})
+    def settings(self, *, enabled=False, include_shared=None, interval=120):
+        payload = {"enabled": enabled, "interval_minutes": interval}
+        if include_shared is not None:
+            payload["include_shared"] = include_shared
+        return self.service.update_maintenance(payload)
 
     def due(self):
         self.service._maintenance["next_run_at"] = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
@@ -34,7 +38,8 @@ class MaintenanceTests(unittest.TestCase):
     def test_defaults_and_strict_complete_settings_persist_separately(self):
         before = self.registry.read_bytes()
         value = self.service.maintenance_snapshot()
-        self.assertEqual((value["enabled"], value["interval_minutes"], value["include_shared"]), (False, 120, True))
+        self.assertEqual((value["enabled"], value["interval_minutes"]), (False, 120))
+        self.assertNotIn("include_shared", value)
         self.assertIsNone(value["next_run_at"])
         for payload in ({}, {"enabled": True, "interval_minutes": 15, "include_shared": True},
                         {"enabled": 1, "interval_minutes": 120, "include_shared": True},
@@ -61,6 +66,45 @@ class MaintenanceTests(unittest.TestCase):
         self.assertNotIn("private-detail", str(error.exception))
         self.assertFalse(self.service.maintenance_snapshot()["enabled"])
 
+    def test_legacy_exclusion_setting_migrates_without_losing_schedule_or_results(self):
+        names = {key: env.name for key, env in self.service.environments.items()}
+        previous = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        future = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        legacy = {"schema_version": 1, **maintenance.initial_state(), "enabled": True,
+                  "interval_minutes": 60, "include_shared": False, "next_run_at": future,
+                  "last_status": "complete", "last_run_at": previous, "last_finished_at": previous,
+                  "last_results": [{"id": "shop01", "name": "旧名称", "status": "complete", "message": "已完成"}],
+                  "login_required_ids": ["shop02"]}
+        self.service.shutdown()
+        self.service._maintenance_path.write_text(json.dumps(legacy), encoding="utf-8")
+        with patch.object(service_module, "_resolve_browser_executable", return_value=self.root / "msedge.exe"):
+            self.service = BrowserService(self.registry)
+        state = self.service.maintenance_snapshot()
+        self.assertTrue(state["enabled"])
+        self.assertEqual(state["interval_minutes"], 60)
+        self.assertEqual(state["next_run_at"], future)
+        self.assertEqual(state["last_run_at"], previous)
+        self.assertEqual(state["last_results"][0]["message"], "已完成")
+        self.assertEqual(self.service._maintenance_required, {"shop02"})
+        self.assertNotIn("include_shared", state)
+        with patch.object(self.service, "_perform", return_value=SUCCESS) as perform:
+            self.service.run_maintenance()
+            self.service._queue.join()
+        self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop01", "shop02", "piaoju"])
+        persisted = json.loads(self.service._maintenance_path.read_text(encoding="utf-8"))
+        self.assertNotIn("include_shared", persisted)
+        restored, _ = maintenance.load(self.service._maintenance_path, names)
+        self.assertTrue(restored["enabled"])
+        self.assertEqual(restored["interval_minutes"], 60)
+
+    def test_legacy_api_false_flag_still_maintains_every_registered_environment(self):
+        state = self.settings(include_shared=False)
+        self.assertNotIn("include_shared", state)
+        with patch.object(self.service, "_perform", return_value=SUCCESS) as perform:
+            self.service.run_maintenance()
+            self.service._queue.join()
+        self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop01", "shop02", "piaoju"])
+
     def test_manual_round_runs_while_disabled_and_cannot_overlap(self):
         self.settings()
         entered, release = threading.Event(), threading.Event()
@@ -82,7 +126,7 @@ class MaintenanceTests(unittest.TestCase):
         value = self.service.maintenance_snapshot()
         self.assertFalse(value["running"])
         self.assertEqual(value["last_status"], "complete")
-        self.assertEqual([row["id"] for row in value["last_results"]], ["shop01", "shop02"])
+        self.assertEqual([row["id"] for row in value["last_results"]], ["shop01", "shop02", "piaoju"])
         self.assertIsNone(value["next_run_at"])
 
     def test_missed_schedule_runs_once_without_snapshot_polling(self):
@@ -91,7 +135,7 @@ class MaintenanceTests(unittest.TestCase):
             self.due()
             self.service._queue.join()
             self.service._maintenance_tick()
-        self.assertEqual(perform.call_count, 2)
+        self.assertEqual(perform.call_count, 3)
         self.assertEqual(len(self.service._jobs), 1)
         self.assertGreater(datetime.fromisoformat(self.service.maintenance_snapshot()["next_run_at"]), datetime.now(timezone.utc))
 
@@ -126,7 +170,8 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(self.service._pending.get("shop02", 0), 1)
             release.set()
             self.service._queue.join()
-        self.assertEqual(calls, [("maintain-session", "shop01"), ("focus", "shop02"), ("maintain-session", "shop02")])
+        self.assertEqual(calls, [("maintain-session", "shop01"), ("focus", "shop02"),
+                                 ("maintain-session", "shop02"), ("maintain-session", "piaoju")])
         self.assertTrue(all(value == 0 for value in self.service._pending.values()))
 
     def test_internal_maintenance_fault_does_not_stop_explicit_actions(self):
@@ -200,7 +245,8 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "maintenance_busy")
             release.set()
             self.service._queue.join()
-        self.assertEqual(calls, [("maintain-session", "shop01"), ("close", "shop01"), ("close", "shop02")])
+        self.assertEqual(calls, [("maintain-session", "shop01"), ("close", "shop01"),
+                                 ("close", "shop02"), ("close", "piaoju")])
         self.assertTrue(self.service.maintenance_snapshot()["enabled"])
         self.assertEqual(self.service.maintenance_snapshot()["last_status"], "paused")
         self.assertIsNotNone(self.service.maintenance_snapshot()["next_run_at"])
@@ -246,7 +292,7 @@ class MaintenanceTests(unittest.TestCase):
             self.settings(enabled=False)
             release.set()
             self.service._queue.join()
-        self.assertEqual(calls, ["shop01", "shop02"])
+        self.assertEqual(calls, ["shop01", "shop02", "piaoju"])
         self.assertEqual(self.service.maintenance_snapshot()["last_status"], "complete")
 
     def test_external_profile_lock_skips_only_that_environment(self):
@@ -258,7 +304,7 @@ class MaintenanceTests(unittest.TestCase):
             with patch.object(self.service, "_perform", return_value=SUCCESS) as perform:
                 self.service.run_maintenance()
                 self.service._queue.join()
-            self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop02"])
+            self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop02", "piaoju"])
             state = self.service.maintenance_snapshot()
             self.assertEqual(state["last_results"][0]["code"], "profile_locked")
         finally:
@@ -266,17 +312,17 @@ class MaintenanceTests(unittest.TestCase):
 
     def test_single_environment_failure_does_not_block_other_environments(self):
         self.settings()
-        with patch.object(self.service, "_perform", side_effect=[RuntimeError("secret"), SUCCESS]):
+        with patch.object(self.service, "_perform", side_effect=[RuntimeError("secret"), SUCCESS, SUCCESS]):
             self.service.run_maintenance()
             self.service._queue.join()
         state = self.service.maintenance_snapshot()
         self.assertEqual(state["last_status"], "partial")
-        self.assertEqual([row["status"] for row in state["last_results"]], ["failed", "complete"])
+        self.assertEqual([row["status"] for row in state["last_results"]], ["failed", "complete", "complete"])
         self.assertNotIn("secret", json.dumps(state))
 
     def test_login_required_marker_survives_restart_and_manual_recheck_can_clear_it(self):
         self.settings(enabled=True)
-        with patch.object(self.service, "_perform", side_effect=[{"auth": {"status": "required"}}, SUCCESS]):
+        with patch.object(self.service, "_perform", side_effect=[{"auth": {"status": "required"}}, SUCCESS, SUCCESS]):
             self.due()
             self.service._queue.join()
         self.assertIn("shop01", self.service._maintenance_required)
@@ -287,11 +333,11 @@ class MaintenanceTests(unittest.TestCase):
         with patch.object(self.service, "_perform", return_value=SUCCESS) as perform:
             self.due()
             self.service._queue.join()
-            self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop02"])
+            self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop02", "piaoju"])
             perform.reset_mock()
             self.service.run_maintenance()
             self.service._queue.join()
-            self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop01", "shop02"])
+            self.assertEqual([call.args[1].id for call in perform.call_args_list], ["shop01", "shop02", "piaoju"])
         self.assertNotIn("shop01", self.service._maintenance_required)
 
     def test_interrupted_round_is_not_resumed_as_overlapping_running_state(self):
@@ -311,6 +357,30 @@ class MaintenanceTests(unittest.TestCase):
         original = json.loads(env.config_path.read_text(encoding="utf-8"))
         self.assertEqual(set(original["browser_sessions"]), {"invoice", "orders"})
         self.assertEqual(original["browser_sessions"]["invoice"]["url"], fixtures.URLS["invoice"])
+
+    def test_url_maintenance_visits_home_saves_its_cookies_and_completes_assumed(self):
+        env = self.generic_environment()
+        page = Mock(url=fixtures.CUSTOM_HOME)
+        controller = self.probe_controller(page)
+        self.service._maintenance_required.add(env.id)
+        def perform(_action, current):
+            return asyncio.run(self.service._maintain_browser(current)) if current.id == env.id else SUCCESS
+        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
+                patch.object(self.service, "_require_owner", return_value=self.process()), \
+                patch.object(service_module, "probe_login_url", new_callable=AsyncMock,
+                             return_value={"status": "assumed", "message": "推定已登录"}) as probe, \
+                patch.object(service_module, "persist_session_cookies", new_callable=AsyncMock,
+                             return_value={**empty_status(), "status": "saved"}) as save, \
+                patch.object(self.service, "_perform", side_effect=perform):
+            self.service.run_maintenance()
+            self.service._queue.join()
+        probe.assert_awaited_once_with(page, fixtures.CUSTOM_HOME, service_module.login_settings.DEFAULTS)
+        self.assertEqual(save.call_args.args[1:3], (set(), {"portal.example.test"}))
+        self.assertEqual(self.service._auth[env.id]["status"], "assumed")
+        self.assertNotIn(env.id, self.service._maintenance_required)
+        state = self.service.maintenance_snapshot()
+        self.assertEqual(state["last_status"], "complete")
+        self.assertEqual(state["last_results"][0]["status"], "complete")
 
     def test_home_matching_never_reuses_invoice_or_order_pages(self):
         expected = service_module.QIANNIU_HOME_URL
@@ -337,45 +407,39 @@ class MaintenanceTests(unittest.TestCase):
         invoice.close.assert_not_awaited()
         orders.close.assert_not_awaited()
 
-    def test_maintenance_reuses_home_without_focus_or_extra_tabs(self):
+    def test_maintenance_uses_the_shared_probe_without_focus_or_platform_gate(self):
         env = self.service.environments["shop01"]
-        page = Mock(url=service_module.QIANNIU_HOME_URL, goto=AsyncMock(), bring_to_front=AsyncMock())
-        controller = Mock(start=AsyncMock(), close=AsyncMock(), page=Mock(return_value=page),
-                          registrations={"home": SimpleNamespace(created=False)}, _browser_owned=False)
-        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
+        page = Mock(url=env.home_url, bring_to_front=AsyncMock())
+        controller = self.probe_controller(page)
+        with patch.object(service_module, "PlaywrightBrowserController", return_value=controller) as factory, \
                 patch.object(self.service, "_require_owner", return_value=self.process()), \
-                patch.object(self.service, "_check_auth", new_callable=AsyncMock, return_value={"status": "verified", "message": "已登录"}), \
+                patch.object(service_module, "probe_login_url", new_callable=AsyncMock,
+                             return_value={"status": "assumed", "message": "推定已登录"}) as probe, \
                 patch.object(self.service, "_save_session", new_callable=AsyncMock, return_value={**empty_status(), "status": "saved"}):
             result = asyncio.run(self.service._maintain_browser(env))
-        self.assertEqual(result["auth"]["status"], "verified")
-        controller.start.assert_awaited_once_with(open_missing=True)
-        page.goto.assert_awaited_once_with(service_module.QIANNIU_HOME_URL, wait_until="domcontentloaded", timeout=15000)
+        self.assertEqual(result["auth"]["status"], "assumed")
+        self.assertTrue(factory.call_args.kwargs["login_probe_mode"])
+        controller.start.assert_awaited_once_with(open_missing=False)
+        probe.assert_awaited_once_with(page, env.home_url, service_module.login_settings.DEFAULTS)
         page.bring_to_front.assert_not_awaited()
-        controller.context.new_page.assert_not_called()
         controller.stop.assert_not_called()
         controller.close.assert_awaited_once()
 
-    def test_new_browser_or_recovered_home_is_not_immediately_navigated_twice(self):
-        for owned, created in ((True, False), (False, True)):
-            page = Mock(goto=AsyncMock())
-            controller = Mock(start=AsyncMock(), close=AsyncMock(), page=Mock(return_value=page),
-                              registrations={"home": SimpleNamespace(created=created)}, _browser_owned=owned)
-            with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
-                    patch.object(self.service, "_require_owner", return_value=self.process()), \
-                    patch.object(self.service, "_check_auth", new_callable=AsyncMock, return_value={"status": "verified", "message": "已登录"}), \
-                    patch.object(self.service, "_save_session", new_callable=AsyncMock, return_value={**empty_status(), "status": "saved"}):
-                asyncio.run(self.service._maintain_browser(self.service.environments["shop01"]))
-            page.goto.assert_not_awaited()
-
-    def test_login_redirect_is_reported_and_never_retried_within_maintenance(self):
-        controller = Mock(start=AsyncMock(side_effect=BrowserControllerError("login", "login_required")), close=AsyncMock())
+    def test_maintenance_final_login_redirect_is_required_without_saving_or_retry(self):
+        env = self.service.environments["shop01"]
+        page = Mock(url="https://login.example.test/enter")
+        controller = self.probe_controller(page)
         with patch.object(service_module, "PlaywrightBrowserController", return_value=controller), \
-                patch.object(self.service, "_require_owner", return_value=self.process()):
-            value = asyncio.run(self.service._maintain_browser(self.service.environments["shop01"]))
+                patch.object(self.service, "_require_owner", return_value=self.process()), \
+                patch.object(service_module, "probe_login_url", new_callable=AsyncMock,
+                             return_value={"status": "required", "message": "需要登录"}) as probe, \
+                patch.object(self.service, "_save_session", new_callable=AsyncMock) as save:
+            value = asyncio.run(self.service._maintain_browser(env))
         self.assertEqual(value["auth"]["status"], "required")
         self.assertIn("shop01", self.service._maintenance_required)
-        controller.start.assert_awaited_once()
-        controller.page.assert_not_called()
+        probe.assert_awaited_once()
+        save.assert_not_awaited()
+
 
 
 if __name__ == "__main__":

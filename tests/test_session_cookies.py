@@ -45,7 +45,7 @@ class CookieParameterTests(unittest.TestCase):
             persistent_cookie_param(cookie(partitionKeyOpaque=True), 100)
 
     def test_business_family_boundaries_and_configured_exact_hosts(self):
-        families, hosts = business_cookie_scope("shop", ["http://127.0.0.1:1234/business", "https://one.custom.test/"])
+        families, hosts = business_cookie_scope("shop", ["https://myseller.taobao.com/", "http://127.0.0.1:1234/business", "https://one.custom.test/"])
         for domain in (".taobao.com", "login.taobao.com", ".tmall.com", "127.0.0.1", "one.custom.test"):
             self.assertTrue(in_scope(domain, families, hosts), domain)
         for domain in ("faketaobao.com", "taobao.com.attacker.test", "alicdn.com", "two.custom.test", "erp321.com"):
@@ -53,6 +53,21 @@ class CookieParameterTests(unittest.TestCase):
         families, hosts = business_cookie_scope("shared", ["https://fp.erp321.com/"])
         self.assertTrue(in_scope(".erp321.com", families, hosts))
         self.assertFalse(in_scope("fakeerp321.com", families, hosts))
+        self.assertFalse(in_scope(".taobao.com", families, hosts))
+
+    def test_generic_cookie_scope_comes_from_configured_sites_without_legacy_platform_families(self):
+        for legacy_kind in ("shop", "shared", "browser"):
+            families, hosts = business_cookie_scope(legacy_kind, ["https://portal.example.test/path?tenant=one", "http://127.0.0.1:8010/"])
+            self.assertEqual(families, set())
+            self.assertEqual(hosts, {"portal.example.test", "127.0.0.1"})
+            for domain in ("portal.example.test", ".example.test", "127.0.0.1"):
+                self.assertTrue(in_scope(domain, families, hosts), domain)
+            for domain in ("other.example.test", "example.test", ".taobao.com", ".tmall.com", ".alibaba.com", ".erp321.com", ".test"):
+                self.assertFalse(in_scope(domain, families, hosts), domain)
+
+    def test_platform_lookalike_hosts_cannot_expand_cookie_family_scope(self):
+        families, hosts = business_cookie_scope("shop", ["https://myseller.taobao.com.attacker.test/"])
+        self.assertEqual(families, set())
         self.assertFalse(in_scope(".taobao.com", families, hosts))
 
     def test_metadata_allowlist_and_untrusted_content_sanitization(self):

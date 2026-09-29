@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 from .browser_lock import FileMutex, FileMutexBusy
@@ -280,13 +280,41 @@ def _same_site(url: str, expected: str) -> bool:
     return bool(actual.scheme in {"http", "https"} and actual.netloc.lower() == target.netloc.lower())
 
 
+def _generic_page_key(url: str) -> tuple[str, str, int, str, str, str] | None:
+    """Compare browser-normalized URLs without rewriting configured homes."""
+    try:
+        parsed = urlsplit(url)
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None):
+            return None
+        host = parsed.hostname.encode("idna").decode("ascii").lower()
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+        # Keep reserved characters and existing escapes intact. In particular,
+        # never decode queries, sort their parameters, or discard hash routes.
+        safe = "/?:@!$&'()*+,;=-._~%"
+        return (parsed.scheme, host, port,
+                quote(parsed.path or "/", safe=safe),
+                quote(parsed.query, safe=safe),
+                quote(parsed.fragment, safe=safe + "#"))
+    except (UnicodeError, ValueError):
+        return None
+
+
 def _same_role_page(url: str, expected: str) -> bool:
     """Match a persisted tab to a role without conflating same-site roles."""
+    if not _role_has_login_detection(expected):
+        # Custom homes may use query parameters or hash routes to select a
+        # tenant or workspace. Never claim another tab merely on its domain
+        # or path, and never navigate that unrelated user tab for recovery.
+        target_key = _generic_page_key(expected)
+        return target_key is not None and _generic_page_key(url) == target_key
     if not _same_site(url, expected):
         return False
-    actual_path = urlsplit(url).path.rstrip("/") or "/"
-    expected_path = urlsplit(expected).path.rstrip("/") or "/"
-    if expected_path == "/" and (urlsplit(expected).hostname or "").lower() == "myseller.taobao.com":
+    actual = urlsplit(url)
+    target = urlsplit(expected)
+    actual_path = actual.path.rstrip("/") or "/"
+    expected_path = target.path.rstrip("/") or "/"
+    if expected_path == "/" and (target.hostname or "").lower() == "myseller.taobao.com":
         # The workbench owns only the seller homepage. Invoice/order routes
         # belong to the independent invoice skill and must never be reused as
         # a homepage target or overwritten during session maintenance.
@@ -306,6 +334,21 @@ def _same_site_family(url: str, expected: str) -> bool:
 def _url_is_login(url: str) -> bool:
     host = (urlsplit(url or "").hostname or "").lower()
     return host in {"jstlogin.erp321.com", "loginmyseller.taobao.com"} or bool(LOGIN_URL_RE.search(url or ""))
+
+
+def _role_has_login_detection(expected: str) -> bool:
+    target = urlsplit(expected)
+    host = (target.hostname or "").lower()
+    path = target.path.rstrip("/")
+    return host == "myseller.taobao.com" or (
+        host == "fp.erp321.com"
+        and path == "/setting/goodsManage"
+    )
+
+
+def _role_is_login(url: str, expected: str) -> bool:
+    """Apply legacy login redirects only to known business role targets."""
+    return _role_has_login_detection(expected) and _url_is_login(url)
 
 
 def _runtime_state_path(data_dir: Path, profile: str) -> Path:
@@ -521,12 +564,16 @@ class PlaywrightBrowserController:
         *,
         headless: bool = False,
         timeout_ms: int = 30_000,
+        login_probe_mode: bool = False,
     ) -> None:
         self.config = dict(config)
         self.config.setdefault("profile_directory", "Default")
         self.config.setdefault("download_dir", str(Path(self.config["user_data_dir"]) / "downloads" / self.config["profile_directory"]))
         self.headless = bool(headless)
         self.timeout_ms = int(timeout_ms)
+        # Workbench login probes own their navigation and final classification;
+        # imported business callers keep the original role/login behavior.
+        self.login_probe_mode = bool(login_probe_mode)
         self.specs = role_specs(self.config)
         self.playwright: Any = None
         self.browser: Any = None
@@ -560,6 +607,8 @@ class PlaywrightBrowserController:
 
     async def _open(self, *, allow_launch: bool, open_missing: bool) -> dict[str, Any]:
         if self.context is not None:
+            if self.login_probe_mode:
+                return self.status()
             return await self.register_roles(open_missing=open_missing)
         try:
             from playwright.async_api import async_playwright
@@ -644,7 +693,7 @@ class PlaywrightBrowserController:
                 ]
                 if profile and profile.lower() != "default":
                     args.append(f"--profile-directory={profile}")
-                args.extend(spec.url for spec in self.specs.values())
+                args.extend(["about:blank"] if self.login_probe_mode else (spec.url for spec in self.specs.values()))
                 if self.headless:
                     args.append("--headless=new")
                 creationflags = 0
@@ -730,6 +779,8 @@ class PlaywrightBrowserController:
         except Exception:
             pass
         try:
+            if self.login_probe_mode:
+                return self.status()
             if launched:
                 # The native command already opened all role URLs. Wait for
                 # their delayed targets/redirects; never create duplicates.
@@ -811,6 +862,45 @@ class PlaywrightBrowserController:
             return []
         return [page for page in self.context.pages if not page.is_closed()]
 
+    async def _probe_target_id(self, page: Any) -> str:
+        session = await self.context.new_cdp_session(page)
+        try:
+            info = await asyncio.wait_for(session.send("Target.getTargetInfo"), timeout=5)
+            target_id = info.get("targetInfo", {}).get("targetId")
+            if not isinstance(target_id, str) or not target_id:
+                raise BrowserControllerError("无法确认检查页面身份", "page_identity_unverified")
+            return target_id
+        finally:
+            await session.detach()
+
+    async def probe_page(self, role: str, *, previous_target_id: str | None = None,
+                         previous_url: str | None = None) -> tuple[Any, str]:
+        """Choose a safely reusable page without navigation or login gates.
+
+        A redirected page is reusable only when this workbench previously
+        owned its exact target and its URL has not subsequently changed.
+        Otherwise reuse an exact homepage or create a new page, never a
+        same-domain login/tenant tab which could belong to the user.
+        """
+        if not self.login_probe_mode or self.context is None:
+            raise BrowserControllerError("登录检查连接尚未就绪", "browser_not_started")
+        spec = self.specs[role]
+        pages = self._pages()
+        if previous_target_id and previous_url:
+            for page in pages:
+                if str(page.url) == previous_url and await self._probe_target_id(page) == previous_target_id:
+                    return page, previous_target_id
+        expected = _generic_page_key(spec.url)
+        for page in pages:
+            if expected is not None and _generic_page_key(str(page.url)) == expected:
+                return page, await self._probe_target_id(page)
+        # Only a browser launched for this probe owns the fresh blank target.
+        # Blank tabs in a browser we merely connected to remain untouched.
+        page = next((item for item in reversed(pages) if self._browser_owned and item.url == "about:blank"), None)
+        if page is None:
+            page = await self.context.new_page()
+        return page, await self._probe_target_id(page)
+
     async def _wait_for_startup_roles(self) -> dict[str, Any]:
         deadline = time.monotonic() + max(0.1, self.timeout_ms / 1000)
         while True:
@@ -833,7 +923,7 @@ class PlaywrightBrowserController:
                 # Preserve a clear login redirect even when a different
                 # loading page timed out.
                 for role, item in self.registrations.items():
-                    if _url_is_login(str(item.page.url or "")):
+                    if _role_is_login(str(item.page.url or ""), self.specs[role].url):
                         raise BrowserControllerError(
                             f"业务页面需要人工登录: {role}", "login_required",
                             details={"role": role},
@@ -854,10 +944,10 @@ class PlaywrightBrowserController:
         for role, spec in self.specs.items():
             has_business_page = any(
                 _same_role_page(str(page.url or ""), spec.url)
-                and not _url_is_login(str(page.url or "")) for page in pages
+                and not _role_is_login(str(page.url or ""), spec.url) for page in pages
             )
             if not has_business_page and any(
-                _url_is_login(str(page.url or ""))
+                _role_is_login(str(page.url or ""), spec.url)
                 and _same_site_family(str(page.url or ""), spec.url) for page in pages
             ):
                 raise BrowserControllerError(
@@ -869,7 +959,7 @@ class PlaywrightBrowserController:
             registered = self.registrations.get(role)
             if registered is not None and not registered.page.is_closed():
                 current = str(registered.page.url or "")
-                if _url_is_login(current):
+                if _role_is_login(current, spec.url):
                     raise BrowserControllerError(
                         f"业务页面需要人工登录: {role}", "login_required",
                         details={"role": role},
@@ -884,14 +974,14 @@ class PlaywrightBrowserController:
                 current = str(page.url or "")
                 if current in {"", "about:blank", "chrome://newtab/"}:
                     continue
-                if _same_role_page(current, spec.url) and not _url_is_login(current):
+                if _same_role_page(current, spec.url) and not _role_is_login(current, spec.url):
                     match = page
                     break
             if match is not None:
                 used.add(id(match))
                 self.registrations[role] = PageRegistration(role, match, created=False)
                 continue
-            if any(_url_is_login(str(page.url or ""))
+            if any(_role_is_login(str(page.url or ""), spec.url)
                    and _same_site_family(str(page.url or ""), spec.url)
                    for page in pages):
                 raise BrowserControllerError(
@@ -923,7 +1013,7 @@ class PlaywrightBrowserController:
                 self.registrations[role] = PageRegistration(role, page, created=True)
                 await page.goto(spec.url, wait_until="domcontentloaded", timeout=self.timeout_ms)
             except Exception as exc:
-                if page is not None and _url_is_login(str(page.url or "")):
+                if page is not None and _role_is_login(str(page.url or ""), spec.url):
                     # Keep the login page available for manual intervention,
                     # including when another resource made goto time out.
                     raise BrowserControllerError(
@@ -941,7 +1031,7 @@ class PlaywrightBrowserController:
                     details={"role": role, "url": spec.url},
                     retryable=True,
                 ) from exc
-            if _url_is_login(str(page.url or "")):
+            if _role_is_login(str(page.url or ""), spec.url):
                 raise BrowserControllerError(
                     f"业务页面需要人工登录: {role}", "login_required",
                     details={"role": role},
@@ -964,7 +1054,7 @@ class PlaywrightBrowserController:
         page = self.page(role)
         spec = self.specs[role]
         current = str(page.url or "")
-        if _url_is_login(current):
+        if _role_is_login(current, spec.url):
             return {
                 "role": role,
                 "is_login": False,
