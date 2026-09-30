@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { actionNames, type Action, type CreatedShop, type CreateShopInput, type Environment, type Job, type LoginCheckSettings, type Maintenance, type MaintenanceSettings, type RegistrationAction, type RegistrationState, type ShutdownStatus, type WorkbenchState } from '../types';
+import { actionNames, sessionAutosaveIntervals, type Action, type CreatedShop, type CreateShopInput, type Environment, type Job, type LoginCheckSettings, type Maintenance, type MaintenanceSettings, type RegistrationAction, type RegistrationState, type SessionAutosave, type SessionAutosaveSettings, type ShutdownStatus, type WorkbenchState } from '../types';
 
 export interface Notice { tone: 'success' | 'warning'; message: string }
 interface PendingJob { ids: string[]; action: Action }
@@ -41,6 +41,7 @@ export function useWorkbench() {
   const [loginCheckSavingIds, setLoginCheckSavingIds] = useState<string[]>([]);
   const [registrationIds, setRegistrationIds] = useState<string[]>([]);
   const [maintenanceSaving, setMaintenanceSaving] = useState(false);
+  const [sessionAutosaveSaving, setSessionAutosaveSaving] = useState(false);
   const [maintenanceSubmitting, setMaintenanceSubmitting] = useState(false);
   const [pendingMaintenanceId, setPendingMaintenanceId] = useState<string | null>(null);
   const [closeAllSubmitting, setCloseAllSubmitting] = useState(false);
@@ -55,12 +56,14 @@ export function useWorkbench() {
   const postRequests = useRef(new Set<AbortController>());
   const posting = useRef(false);
   const maintenancePosting = useRef(false);
+  const sessionAutosavePosting = useRef(false);
   const closeAllPosting = useRef(false);
   const closeAllPending = useRef<string | null>(null);
   const createPosting = useRef(false);
   const pickerPosting = useRef(false);
   const loginCheckPosting = useRef(new Set<string>());
   const stateMutationVersion = useRef(0);
+  const sessionAutosaveUpdate = useRef<{ version: number; settings: SessionAutosave } | null>(null);
   const loginCheckUpdates = useRef(new Map<string, { version: number; login_check: LoginCheckSettings; auth: Environment['auth'] }>());
   const registrationPosting = useRef(new Set<string>());
   const registrationUpdates = useRef(new Map<string, { version: number; state: RegistrationState; environment: Environment }>());
@@ -110,13 +113,16 @@ export function useWorkbench() {
         }
         if (stopped) return;
         const serverChanged = stateRef.current !== null && stateRef.current.csrf_token !== next.csrf_token;
-        if (serverChanged) { loginCheckUpdates.current.clear(); registrationUpdates.current.clear(); }
+        if (serverChanged) { loginCheckUpdates.current.clear(); registrationUpdates.current.clear(); sessionAutosaveUpdate.current = null; }
         else next.environments = next.environments.map(environment => {
           const saved = loginCheckUpdates.current.get(environment.id);
           return saved && saved.version > settingsVersion ? { ...environment, login_check: saved.login_check, auth: saved.auth } : environment;
         });
         if (!serverChanged) for (const [id, update] of registrationUpdates.current) {
           if (update.version > settingsVersion) next = applyRegistration(next, id, update.state, update.environment);
+        }
+        if (!serverChanged && sessionAutosaveUpdate.current && sessionAutosaveUpdate.current.version > settingsVersion) {
+          next = { ...next, session_autosave: sessionAutosaveUpdate.current.settings };
         }
         stateRef.current = next;
         setState(next);
@@ -192,6 +198,7 @@ export function useWorkbench() {
           stateRef.current = null;
           loginCheckUpdates.current.clear();
           registrationUpdates.current.clear();
+          sessionAutosaveUpdate.current = null;
           setState(null);
           pendingRef.current = {};
           setPendingJobs({});
@@ -400,6 +407,36 @@ export function useWorkbench() {
     }
   }, []);
 
+  const saveSessionAutosave = useCallback(async (settings: SessionAutosaveSettings): Promise<boolean> => {
+    if (shutdownStatusRef.current !== 'running' || sessionAutosavePosting.current || !stateRef.current?.session_autosave) return false;
+    sessionAutosavePosting.current = true;
+    setSessionAutosaveSaving(true);
+    setActionError(null);
+    setNotice(null);
+    try {
+      const result = await postShopRequest('/api/session-autosave', settings, 60000) as { session_autosave?: SessionAutosave };
+      const saved = result.session_autosave;
+      if (!saved || typeof saved.enabled !== 'boolean' || !sessionAutosaveIntervals.some(value => value === saved.interval_minutes)
+          || (saved.message !== undefined && typeof saved.message !== 'string')) {
+        throw new Error('后台未返回完整的自动保存设置，请刷新状态核对。');
+      }
+      if (!mounted.current || !stateRef.current) return false;
+      sessionAutosaveUpdate.current = { version: ++stateMutationVersion.current, settings: saved };
+      const next = { ...stateRef.current, session_autosave: saved };
+      stateRef.current = next;
+      setState(next);
+      setNotice({ tone: 'success', message: saved.enabled ? `自动保存设置已保存，间隔为 ${saved.interval_minutes} 分钟。` : '设置已保存，定时自动保存会话已关闭。' });
+      refresh();
+      return true;
+    } catch (reason) {
+      if (mounted.current) setActionError(reason instanceof Error ? reason.message : '自动保存设置未保存，请重试。');
+      return false;
+    } finally {
+      sessionAutosavePosting.current = false;
+      if (mounted.current) setSessionAutosaveSaving(false);
+    }
+  }, [postShopRequest, refresh]);
+
   const saveLoginCheck = useCallback(async (environmentId: string, settings: LoginCheckSettings): Promise<LoginCheckSettings> => {
     if (loginCheckPosting.current.has(environmentId) || registrationPosting.current.has(environmentId)) throw new Error('该环境正在更新设置，请稍候。');
     const environment = stateRef.current?.environments.find(item => item.id === environmentId);
@@ -543,7 +580,7 @@ export function useWorkbench() {
   const pendingIds = new Set([...Object.values(pendingJobs).flatMap(job => job.ids), ...submittingIds, ...loginCheckSavingIds, ...registrationIds]);
   const pendingStartJobs = Object.values(pendingJobs).filter(job => job.action === 'start');
   return { state, error: actionError ?? error, notice, refreshing, pendingIds, pendingStartJobs, submitting: submittingIds.length > 0,
-    refresh, runAction, dismissNotice: () => setNotice(null), saveMaintenance, runMaintenance, maintenanceSaving,
+    refresh, runAction, dismissNotice: () => setNotice(null), saveMaintenance, runMaintenance, maintenanceSaving, saveSessionAutosave, sessionAutosaveSaving,
     closeAllShops, closeAllSubmitting, closeAllPending: closeAllSubmitting || pendingCloseAllId !== null || !!state?.jobs.some(job => job.close_all && active(job.status)),
     createShop, pickFolder, saveLoginCheck, changeRegistration, registrationIds, stopWorkbench, shutdownStatus, shutdownError, shutdownMessage,
     maintenanceStarting: maintenanceSubmitting || pendingMaintenanceId !== null || !!state?.jobs.some(job => job.action === 'maintain-session' && active(job.status)) };

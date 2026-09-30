@@ -45,6 +45,7 @@ from .session_cookies import (
 )
 from . import maintenance as maintenance_state
 from . import login_settings
+from . import session_settings
 from . import lifecycle
 from .login_probe import probe_login_url
 from . import shop_registry
@@ -54,7 +55,6 @@ VENDOR = Path(__file__).resolve().parent / "vendor"
 GOODS_FRAME_URL = "https://src.erp321.com/erp-web-group/erp-scm-invoice-goods/index"
 QIANNIU_HOME_URL = "https://myseller.taobao.com/"
 ACTIONS = {"start", "focus", "check-login", "save-session", "close", "open-folder", "open-results"}
-COOKIE_CHECKPOINT_SECONDS = 60
 JST_PAGE_READY_SECONDS = 5
 
 
@@ -301,6 +301,11 @@ class BrowserService:
         self._state_lock = threading.RLock()
         self._creation_lock = threading.Lock()
         self._poll_lock = threading.Lock()
+        self._session_settings_lock = threading.Lock()
+        self._autosave_action_lock = threading.Lock()
+        self._session_autosave_path = self.registry_path.parent / session_settings.FILE_NAME
+        self._session_autosave = session_settings.load(self._session_autosave_path)
+        self._session_autosave_revision = 0
         self._inventory: list[dict[str, Any]] = []
         self._inventory_at = 0.0
         self._inventory_error: str | None = None
@@ -312,7 +317,9 @@ class BrowserService:
         self._probe_targets: dict[str, dict[str, Any]] = {}
         self._checkpoint_env: str | None = None
         self._cookie_sync = {key: read_cookie_metadata(env.root) for key, env in self.environments.items()}
-        self._next_cookie_sync = {key: time.monotonic() + COOKIE_CHECKPOINT_SECONDS for key in self.environments}
+        self._next_cookie_sync: dict[str, float] = {}
+        for key in self.environments:
+            self._schedule_cookie_sync(key)
         self._idle_retry_after = 0.0
         self._jobs: list[dict[str, Any]] = []
         self._activity: list[dict[str, Any]] = []
@@ -458,9 +465,8 @@ class BrowserService:
                 self._lifecycle = updated
                 self._auth[env_id] = self._unchecked("环境已恢复，请重新检查登录" if target == "active" else "环境已归档，自动任务已排除")
                 self._probe_targets.pop(env_id, None)
-                if target == "active":
-                    self._next_cookie_sync[env_id] = time.monotonic() + COOKIE_CHECKPOINT_SECONDS
-                elif target == "deleted":
+                self._schedule_cookie_sync(env_id)
+                if target == "deleted":
                     self.environments = {key: value for key, value in self.environments.items() if key != env_id}
                     self._next_cookie_sync.pop(env_id, None)
                     self._observations.pop(env_id, None)
@@ -493,12 +499,12 @@ class BrowserService:
                     raise BrowserServiceError("新环境与已有环境冲突，未注册到当前服务", "shop_conflict")
                 self._auth[env.id] = self._unchecked()
                 self._cookie_sync[env.id] = read_cookie_metadata(env.root)
-                self._next_cookie_sync[env.id] = time.monotonic() + COOKIE_CHECKPOINT_SECONDS
                 self._observations[env.id] = {"running": False, "cdp": "stopped", "tabs_count": 0, "tabs": []}
                 self._process_keys[env.id] = None
                 self._pending[env.id] = 0
                 # Readers holding the previous mapping can finish safely.
                 self.environments = {**self.environments, env.id: env}
+                self._schedule_cookie_sync(env.id)
                 self._inventory_at = 0
             return {"id": env.id, "name": env.name, "kind": "browser", "login_username": env.login_username,
                     "home_url": env.home_url,
@@ -655,6 +661,7 @@ class BrowserService:
                     "issuer": self.issuer, "updated_at": now(), "activity": deepcopy(self._activity[-50:]),
                     "jobs": deepcopy(self._jobs[-20:]), "summary": summary,
                     "maintenance": deepcopy(self._maintenance),
+                    "session_autosave": deepcopy(self._session_autosave),
                     "creation_defaults": {"parent_folder": str(self.registry_path.parent)},
                     "error": {"code": "process_inventory_failed", "message": self._inventory_error}
                     if self._inventory_error else None}
@@ -705,6 +712,47 @@ class BrowserService:
             self._jobs[-1]["close_all"] = True
             self._close_all_job_id = result["id"]
             return result
+
+    def _schedule_cookie_sync(self, env_id: str) -> None:
+        """Caller holds state lock (or is initializing the service)."""
+        if self._session_autosave["enabled"] and self._is_active(env_id):
+            self._next_cookie_sync[env_id] = time.monotonic() + self._session_autosave["interval_minutes"] * 60
+        else:
+            self._next_cookie_sync.pop(env_id, None)
+
+    def _automatic_save_allowed(self, env_id: str, revision: int | None = None) -> bool:
+        with self._state_lock:
+            return (not self._closed and self._session_autosave["enabled"] and self._queue.empty()
+                    and self._is_active(env_id)
+                    and (revision is None or revision == self._session_autosave_revision))
+
+    def update_session_autosave(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            settings = session_settings.validate_settings(payload)
+        except ValueError as exc:
+            raise BrowserServiceError("自动保存设置无效，请完整填写开关和间隔", "invalid_session_autosave") from exc
+        # Serialize settings updates without blocking the worker's state access
+        # while an already admitted checkpoint releases its profile lock.
+        with self._session_settings_lock:
+            with self._state_lock:
+                if self._closed:
+                    raise BrowserServiceError("工作台正在关闭", "service_closed")
+                try:
+                    session_settings.save(self._session_autosave_path, settings)
+                except OSError as exc:
+                    raise BrowserServiceError("自动保存设置保存失败，请检查配置目录", "session_autosave_storage_failed") from exc
+                self._session_autosave = settings
+                self._session_autosave_revision += 1
+                self._next_cookie_sync.clear()
+                for env_id in self.environments:
+                    self._schedule_cookie_sync(env_id)
+                self._idle_retry_after = 0.0
+            if not settings["enabled"]:
+                # Return only after a checkpoint admitted under the old setting
+                # has yielded and detached. No new automatic work can start.
+                with self._autosave_action_lock:
+                    pass
+            return deepcopy(settings)
 
     def maintenance_snapshot(self) -> dict[str, Any]:
         with self._state_lock:
@@ -925,8 +973,8 @@ class BrowserService:
                     except Exception:
                         # A failed background probe must not stop the sole
                         # worker or starve subsequent explicit actions.
-                        self._idle_retry_after = time.monotonic() + COOKIE_CHECKPOINT_SECONDS
                         with self._state_lock:
+                            self._idle_retry_after = time.monotonic() + self._session_autosave["interval_minutes"] * 60
                             self._activity.append({"id": uuid.uuid4().hex, "at": now(), "environment_id": "",
                                                    "name": "工作台", "action": "save-session", "level": "error",
                                                    "message": "自动保存检查暂未完成，稍后重试；手动操作仍可使用"})
@@ -975,45 +1023,49 @@ class BrowserService:
 
     def _idle_checkpoint(self) -> None:
         """One lock-aware checkpoint only when explicit actions are absent."""
-        if self._closed or not self._queue.empty():
-            return
         current = time.monotonic()
         with self._state_lock:
+            if self._closed or not self._session_autosave["enabled"] or not self._queue.empty():
+                return
+            revision = self._session_autosave_revision
             due = sorted((due_at, key) for key, due_at in self._next_cookie_sync.items()
                          if due_at <= current and self._is_active(key))
         if not due:
             return
         self._refresh()
         _, env_id = due[0]
-        with self._state_lock:
-            if not self._is_active(env_id):
-                return
-            self._next_cookie_sync[env_id] = current + COOKIE_CHECKPOINT_SECONDS
-            env = self.environments[env_id]
-        if profile_busy(env.root):
-            return
-        with self._state_lock:
-            observed = self._observations.get(env_id, {})
-            ready = (not self._inventory_error and observed.get("cdp") == "connected"
-                     and not self._pending.get(env_id))
-            # Admit this checkpoint atomically with shutdown. Once admitted,
-            # it finishes with the worker before the service can exit.
-            if not ready or self._closed or not self._queue.empty() or not self._is_active(env_id):
-                return
-            self._checkpoint_env = env_id
-        try:
-            asyncio.run(self._browser_action("save-session", env, automatic=True))
-        except Exception as exc:
-            if getattr(exc, "code", "") == "profile_locked":
+        # The settings endpoint can close admission immediately, then wait for
+        # this short checkpoint to release its profile lock before responding.
+        with self._autosave_action_lock:
+            with self._state_lock:
+                if not self._automatic_save_allowed(env_id, revision):
+                    return
+                self._schedule_cookie_sync(env_id)
+                env = self.environments[env_id]
+            if profile_busy(env.root):
                 return
             with self._state_lock:
-                self._activity.append({"id": uuid.uuid4().hex, "at": now(), "environment_id": env_id,
-                                       "name": env.name, "action": "save-session", "level": "error",
-                                       "message": "会话自动保存未完成，可在环境详情中重试保存"})
-                self._activity = self._activity[-50:]
-        finally:
-            with self._state_lock:
-                self._checkpoint_env = None
+                observed = self._observations.get(env_id, {})
+                ready = (not self._inventory_error and observed.get("cdp") == "connected"
+                         and not self._pending.get(env_id))
+                if not ready or not self._automatic_save_allowed(env_id, revision):
+                    return
+                self._checkpoint_env = env_id
+            try:
+                asyncio.run(self._browser_action("save-session", env, automatic=True,
+                                                 checkpoint_revision=revision))
+            except Exception as exc:
+                if (getattr(exc, "code", "") == "profile_locked"
+                        or not self._automatic_save_allowed(env_id, revision)):
+                    return
+                with self._state_lock:
+                    self._activity.append({"id": uuid.uuid4().hex, "at": now(), "environment_id": env_id,
+                                           "name": env.name, "action": "save-session", "level": "error",
+                                           "message": "会话自动保存未完成，可在环境详情中重试保存"})
+                    self._activity = self._activity[-50:]
+            finally:
+                with self._state_lock:
+                    self._checkpoint_env = None
 
     @staticmethod
     def _friendly_error(exc: Exception) -> BrowserServiceError:
@@ -1134,12 +1186,17 @@ class BrowserService:
                 self._auth[env_id] = self._unchecked("浏览器进程已变化，正在重新检查登录")
             self._process_keys[env_id] = fingerprint
 
-    async def _save_session(self, env: Environment, browser: Any, *, automatic: bool = False) -> dict[str, Any]:
+    async def _save_session(self, env: Environment, browser: Any, *, automatic: bool = False,
+                            checkpoint_revision: int | None = None) -> dict[str, Any]:
+        with self._state_lock:
+            revision = self._session_autosave_revision if checkpoint_revision is None else checkpoint_revision
+            if automatic and not self._automatic_save_allowed(env.id, revision):
+                return deepcopy(self._cookie_sync[env.id])
         urls = [value["url"] if isinstance(value, dict) else value for value in env.config["browser_sessions"].values()]
         families, hosts = business_cookie_scope(env.kind, urls)
         result = await persist_session_cookies(
             browser, families, hosts,
-            should_continue=(lambda: not self._closed and self._queue.empty()) if automatic else None,
+            should_continue=(lambda: self._automatic_save_allowed(env.id, revision)) if automatic else None,
         )
         with self._state_lock:
             if not result["last_saved_at"]:
@@ -1151,7 +1208,9 @@ class BrowserService:
             result["message"] = "无法写入会话保存记录，浏览器保持运行，请检查数据目录后重试"
         with self._state_lock:
             self._cookie_sync[env.id] = result
-            self._next_cookie_sync[env.id] = time.monotonic() + COOKIE_CHECKPOINT_SECONDS
+            # An update made during the CDP request already reset its deadline.
+            if revision == self._session_autosave_revision:
+                self._schedule_cookie_sync(env.id)
         return deepcopy(result)
 
     @staticmethod
@@ -1159,13 +1218,20 @@ class BrowserService:
         if result["status"] != "saved":
             raise BrowserServiceError(result["message"], "cookie_sync_failed")
 
-    async def _browser_action(self, action: str, env: Environment, *, automatic: bool = False) -> dict[str, Any]:
+    async def _browser_action(self, action: str, env: Environment, *, automatic: bool = False,
+                              checkpoint_revision: int | None = None) -> dict[str, Any]:
+        with self._state_lock:
+            revision = self._session_autosave_revision if checkpoint_revision is None else checkpoint_revision
+            if automatic and not self._automatic_save_allowed(env.id, revision):
+                return {"message": "自动保存已停止或让位于排队操作"}
         if action in {"start", "check-login"}:
             return await self._run_login_check(env, allow_launch=action == "start")
 
         lock = ProfileLock(env.root, env.config["profile_directory"])
         lock.acquire()
         try:
+            if automatic and not self._automatic_save_allowed(env.id, revision):
+                return {"message": "自动保存已停止或让位于排队操作"}
             try:
                 record = self._require_owner(env)
             except BrowserServiceError as exc:
@@ -1179,16 +1245,23 @@ class BrowserService:
             fingerprint = self._process_key(record)
             if action == "focus":
                 return await self._focus_browser(env, record, fingerprint)
+            if automatic and not self._automatic_save_allowed(env.id, revision):
+                return {"message": "自动保存已停止或让位于排队操作"}
             from playwright.async_api import async_playwright
-            runtime = await async_playwright().start()
+            runtime = await asyncio.wait_for(async_playwright().start(), timeout=8) if automatic else await async_playwright().start()
             browser = None
             try:
+                if automatic and not self._automatic_save_allowed(env.id, revision):
+                    return {"message": "自动保存已停止或让位于排队操作"}
                 browser = await runtime.chromium.connect_over_cdp(env.endpoint, timeout=8000)
+                if automatic and not self._automatic_save_allowed(env.id, revision):
+                    return {"message": "自动保存已停止或让位于排队操作"}
                 if action in {"close", "save-session"}:
                     self._require_owner(env, expected=fingerprint)
-                    if automatic and (self._closed or not self._queue.empty()):
-                        return {"message": "已优先处理排队操作，将在下次空闲时保存会话"}
-                    saved = await self._save_session(env, browser, automatic=automatic)
+                    if automatic and not self._automatic_save_allowed(env.id, revision):
+                        return {"message": "自动保存已停止或让位于排队操作"}
+                    saved = await self._save_session(env, browser, automatic=automatic,
+                                                     checkpoint_revision=revision)
                     self._require_saved(saved)
                     if action == "save-session":
                         return {"message": saved["message"], "cookie_sync": saved}

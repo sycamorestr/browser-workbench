@@ -318,6 +318,7 @@ class BrowserServiceTests(unittest.TestCase):
                      lambda: self.service.close_all_shops({"pause_maintenance": True}),
                      lambda: self.service.create_shop({}),
                      lambda: self.service.update_maintenance(settings),
+                     lambda: self.service.update_session_autosave({"enabled": False, "interval_minutes": 5}),
                      self.service.run_maintenance]
         for mutate in mutations:
             with self.assertRaises(BrowserServiceError) as caught:
@@ -776,9 +777,168 @@ class BrowserServiceTests(unittest.TestCase):
                 patch.object(service_module, "profile_busy", return_value=False), \
                 patch.object(self.service, "_browser_action", new_callable=AsyncMock) as action:
             self.service._idle_checkpoint()
-            action.assert_awaited_once_with("save-session", self.service.environments["shop01"], automatic=True)
+            action.assert_awaited_once_with("save-session", self.service.environments["shop01"], automatic=True,
+                                           checkpoint_revision=0)
             self.service._idle_checkpoint()
             action.assert_awaited_once()
+
+    def test_autosave_settings_reschedule_disable_and_reload_without_browser_actions(self):
+        with patch.object(self.service, "_refresh"), \
+                patch.object(service_module, "profile_busy", return_value=False), \
+                patch.object(self.service, "_browser_action", new_callable=AsyncMock) as action:
+            self.assertEqual(self.service.snapshot()["session_autosave"], {"enabled": True, "interval_minutes": 5})
+            with patch.object(service_module.time, "monotonic", return_value=100):
+                self.service.update_session_autosave({"enabled": True, "interval_minutes": 10})
+            self.assertEqual(set(self.service._next_cookie_sync.values()), {700})
+            self.service.update_session_autosave({"enabled": False, "interval_minutes": 30})
+            self.assertEqual(self.service._next_cookie_sync, {})
+            self.service._idle_checkpoint()
+            action.assert_not_awaited()
+            self.assertEqual(self.service._jobs, [])
+        self.service.shutdown()
+        with patch.object(service_module, "_resolve_browser_executable", return_value=self.root / "msedge.exe"):
+            self.service = BrowserService(self.registry)
+        self.assertEqual(self.service._session_autosave, {"enabled": False, "interval_minutes": 30})
+        self.assertEqual(self.service._next_cookie_sync, {})
+        with patch.object(service_module.time, "monotonic", return_value=200):
+            self.service.update_session_autosave({"enabled": True, "interval_minutes": 1})
+        self.assertEqual(set(self.service._next_cookie_sync.values()), {260})
+
+    def test_autosave_storage_failure_preserves_memory_deadlines_and_file(self):
+        self.service.update_session_autosave({"enabled": True, "interval_minutes": 10})
+        deadlines = dict(self.service._next_cookie_sync)
+        content = self.service._session_autosave_path.read_bytes()
+        revision = self.service._session_autosave_revision
+        with patch.object(service_module.session_settings, "save", side_effect=PermissionError("private path")):
+            with self.assertRaises(BrowserServiceError) as caught:
+                self.service.update_session_autosave({"enabled": False, "interval_minutes": 30})
+        self.assertEqual(caught.exception.code, "session_autosave_storage_failed")
+        self.assertNotIn("private", str(caught.exception))
+        self.assertEqual(self.service._session_autosave, {"enabled": True, "interval_minutes": 10})
+        self.assertEqual(self.service._next_cookie_sync, deadlines)
+        self.assertEqual(self.service._session_autosave_revision, revision)
+        self.assertEqual(self.service._session_autosave_path.read_bytes(), content)
+
+    def test_settings_change_during_inventory_invalidates_selected_checkpoint(self):
+        for enabled in (True, False):
+            self.service.update_session_autosave({"enabled": True, "interval_minutes": 1})
+            self.service._next_cookie_sync = {"shop01": 0}
+            self.service._observations["shop01"] = {"cdp": "connected"}
+            with patch.object(self.service, "_refresh", side_effect=lambda: self.service.update_session_autosave(
+                    {"enabled": enabled, "interval_minutes": 60})), \
+                    patch.object(service_module, "ProfileLock") as lock, \
+                    patch.object(service_module, "profile_busy") as busy, \
+                    patch.object(self.service, "_browser_action", new_callable=AsyncMock) as action:
+                self.service._idle_checkpoint()
+                lock.assert_not_called()
+                busy.assert_not_called()
+                action.assert_not_awaited()
+
+    def test_interval_change_after_admission_does_not_start_stale_checkpoint(self):
+        self.service._next_cookie_sync = {"shop01": 0}
+        self.service._observations["shop01"] = {"cdp": "connected"}
+        original = self.service._browser_action
+        async def change_interval(*args, **kwargs):
+            self.service.update_session_autosave({"enabled": True, "interval_minutes": 60})
+            return await original(*args, **kwargs)
+        with patch.object(self.service, "_refresh"), \
+                patch.object(service_module, "profile_busy", return_value=False), \
+                patch.object(service_module, "ProfileLock") as lock, \
+                patch.object(self.service, "_browser_action", side_effect=change_interval):
+            self.service._idle_checkpoint()
+        lock.assert_not_called()
+
+    def test_disable_waits_for_admitted_checkpoint_to_detach_without_cookie_write(self):
+        self.service._next_cookie_sync = {"shop01": 0}
+        self.service._observations["shop01"] = {"cdp": "connected"}
+        connected, release, persisted, updated = (threading.Event() for _ in range(4))
+        browser = Mock(close=AsyncMock())
+        runtime, playwright = self.playwright(browser)
+        async def connect(*_args, **_kwargs):
+            connected.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return browser
+        runtime.chromium.connect_over_cdp.side_effect = connect
+        original_save = service_module.session_settings.save
+        def save(path, settings):
+            original_save(path, settings)
+            persisted.set()
+        def disable():
+            self.service.update_session_autosave({"enabled": False, "interval_minutes": 5})
+            updated.set()
+        worker = threading.Thread(target=self.service._idle_checkpoint)
+        writer = threading.Thread(target=disable)
+        with playwright, patch.object(self.service, "_refresh"), \
+                patch.object(service_module, "profile_busy", return_value=False), \
+                patch.object(self.service, "_require_owner", return_value=self.process()), \
+                patch.object(service_module.session_settings, "save", side_effect=save), \
+                patch.object(service_module, "persist_session_cookies", new_callable=AsyncMock) as cookies:
+            try:
+                worker.start()
+                self.assertTrue(connected.wait(2))
+                writer.start()
+                self.assertTrue(persisted.wait(2))
+                with self.service._state_lock:
+                    self.assertFalse(self.service._session_autosave["enabled"])
+                self.assertFalse(updated.is_set())
+            finally:
+                release.set()
+                worker.join(3)
+                if writer.ident is not None:
+                    writer.join(3)
+            self.assertTrue(updated.is_set())
+            self.assertFalse(worker.is_alive())
+            self.assertFalse(writer.is_alive())
+            cookies.assert_not_awaited()
+            browser.close.assert_awaited_once()
+            runtime.stop.assert_awaited_once()
+        self.assertIsNone(self.service._checkpoint_env)
+        self.assertEqual(self.service._next_cookie_sync, {})
+        self.assertFalse(service_module.profile_busy(self.service.environments["shop01"].root))
+
+    def test_disabled_autosave_keeps_manual_save_and_close_available(self):
+        self.service.update_session_autosave({"enabled": False, "interval_minutes": 5})
+        browser = Mock(contexts=[], close=AsyncMock(), new_browser_cdp_session=AsyncMock(
+            return_value=Mock(send=AsyncMock())))
+        _, playwright = self.playwright(browser)
+        with playwright, patch.object(self.service, "_require_owner", return_value=self.process()), \
+                patch.object(self.service, "_wait_for_exit", new_callable=AsyncMock), \
+                patch.object(service_module, "persist_session_cookies", new_callable=AsyncMock,
+                             return_value={**empty_status(), "status": "saved", "persisted_count": 2}) as save:
+            for action in ("save-session", "close"):
+                result = asyncio.run(self.service._browser_action(action, self.service.environments["shop01"]))
+                self.assertEqual(result["cookie_sync"]["status"], "saved")
+            self.assertEqual(save.await_count, 2)
+            self.assertIsNone(save.call_args.kwargs["should_continue"])
+        self.assertEqual(self.service._next_cookie_sync, {})
+
+    def test_auto_cookie_writes_yield_after_setting_change_without_replacing_new_deadline(self):
+        env = self.service.environments["shop01"]
+        session = Mock(detach=AsyncMock())
+        async def send(method, *_args):
+            self.assertEqual(method, "Storage.getCookies")
+            with patch.object(service_module.time, "monotonic", return_value=100):
+                self.service.update_session_autosave({"enabled": True, "interval_minutes": 60})
+            return {"cookies": [{"name": "example", "value": "test", "domain": ".taobao.com",
+                                  "path": "/", "session": True}]}
+        session.send = AsyncMock(side_effect=send)
+        browser = Mock(new_browser_cdp_session=AsyncMock(return_value=session))
+        value = asyncio.run(self.service._save_session(env, browser, automatic=True))
+        session.send.assert_awaited_once_with("Storage.getCookies")
+        self.assertEqual(value["persisted_count"], 0)
+        self.assertEqual(self.service._next_cookie_sync[env.id], 3700)
+
+    def test_closed_environment_is_skipped_without_profile_lock_or_browser_connection(self):
+        self.service._next_cookie_sync = {"shop01": 0}
+        self.service._observations["shop01"] = {"cdp": "stopped"}
+        with patch.object(self.service, "_refresh"), \
+                patch.object(service_module, "profile_busy", return_value=False), \
+                patch.object(service_module, "ProfileLock") as lock, \
+                patch.object(self.service, "_browser_action", new_callable=AsyncMock) as action:
+            self.service._idle_checkpoint()
+        lock.assert_not_called()
+        action.assert_not_awaited()
 
     def test_idle_exception_does_not_stop_worker_or_block_explicit_actions(self):
         failed = threading.Event()

@@ -18,6 +18,7 @@ class FakeService:
     def __init__(self):
         self.actions = []
         self.maintenance_updates = []
+        self.session_autosave_updates = []
         self.maintenance_runs = 0
         self.created_shops = []
         self.closed_shop_groups = []
@@ -39,6 +40,10 @@ class FakeService:
     def run_maintenance(self):
         self.maintenance_runs += 1
         return {"id": "maintenance-job", "status": "queued"}
+
+    def update_session_autosave(self, settings):
+        self.session_autosave_updates.append(settings)
+        return settings
 
     def create_shop(self, payload):
         self.created_shops.append(payload)
@@ -157,6 +162,31 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(self.service.maintenance_updates, [settings])
         self.assertEqual(self.service.maintenance_runs, 1)
         self.assertEqual(self.service.actions, [])
+
+    def test_session_autosave_validates_route_security_and_exact_payload(self):
+        path = "/api/session-autosave"
+        settings = {"enabled": False, "interval_minutes": 10}
+        for headers in ({"Origin": "https://example.com"}, {"X-CSRF-Token": ""},
+                        {"Host": f"evil.test:{self.port}"}, {"Sec-Fetch-Site": "cross-site"}):
+            self.assertEqual(self.maintenance_post(path, settings, **headers)[0], 403)
+        for bad in ({}, [], {"enabled": False}, {"enabled": 0, "interval_minutes": 10},
+                    {"enabled": True, "interval_minutes": True}, {"enabled": True, "interval_minutes": 2},
+                    {**settings, "path": "D:/"}, {**settings, "interval_minutes": "10"}):
+            self.assertEqual(self.maintenance_post(path, bad)[0], 400)
+        self.assertEqual(self.service.session_autosave_updates, [])
+        status, body, _ = self.maintenance_post(path, settings)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"session_autosave": settings})
+        self.assertEqual(self.service.session_autosave_updates, [settings])
+        self.assertEqual(self.service.actions, [])
+        self.assertEqual(self.service.maintenance_updates, [])
+
+    def test_session_autosave_storage_failure_is_not_reported_as_success(self):
+        with patch.object(self.service, "update_session_autosave", side_effect=BrowserServiceError(
+                "自动保存设置保存失败，请检查配置目录", "session_autosave_storage_failed")):
+            status, body, _ = self.maintenance_post("/api/session-autosave", {"enabled": False, "interval_minutes": 5})
+        self.assertEqual(status, 503)
+        self.assertEqual(json.loads(body)["error"]["code"], "session_autosave_storage_failed")
 
     def test_login_check_settings_require_token_origin_and_valid_fields(self):
         path = "/api/environments/login-check"
@@ -326,7 +356,7 @@ class HttpBoundaryTests(unittest.TestCase):
         self.assertEqual(self.service.shutdown_calls, [False, True])
         with patch("backend.server.choose_folder") as picker:
             for path in ("/api/actions", "/api/environments", "/api/environments/close-all", "/api/environments/login-check", "/api/shops", "/api/shops/close-all",
-                         "/api/maintenance", "/api/maintenance/run", "/api/folders/pick",
+                         "/api/maintenance", "/api/maintenance/run", "/api/session-autosave", "/api/folders/pick",
                          "/api/environments/archive", "/api/environments/restore", "/api/environments/delete"):
                 status, body, _ = self.maintenance_post(path, {})
                 self.assertEqual(status, 409)

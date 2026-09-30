@@ -88,6 +88,17 @@ export interface MaintenanceSettings {
   interval_minutes: number;
 }
 
+export const sessionAutosaveIntervals = [1, 5, 10, 30, 60] as const;
+
+export interface SessionAutosaveSettings {
+  enabled: boolean;
+  interval_minutes: number;
+}
+
+export interface SessionAutosave extends SessionAutosaveSettings {
+  message?: string;
+}
+
 export interface Maintenance extends MaintenanceSettings {
   next_run_at: string | null;
   running: boolean;
@@ -111,6 +122,7 @@ export interface WorkbenchState {
   inventory_error?: string | null;
   error?: { code: string; message: string } | null;
   maintenance?: Maintenance;
+  session_autosave?: SessionAutosave;
   creation_defaults?: { parent_folder: string };
 }
 

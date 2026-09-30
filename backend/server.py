@@ -16,6 +16,7 @@ from .folder_picker import choose_folder
 from .shop_registry import validate_home_url
 from .maintenance import validate_settings
 from .login_settings import validate_settings as validate_login_settings
+from .session_settings import validate_settings as validate_session_settings
 
 APP_ID = "browser-workbench"
 APP_VERSION = "0.2.0"
@@ -156,7 +157,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_request(mutate=True):
             return
         path = urlsplit(self.path).path
-        if path not in {"/api/actions", "/api/maintenance", "/api/maintenance/run",
+        if path not in {"/api/actions", "/api/maintenance", "/api/maintenance/run", "/api/session-autosave",
                         "/api/environments", "/api/environments/close-all", "/api/shops", "/api/shops/close-all",
                         "/api/folders/pick", "/api/shutdown", "/api/environments/login-check",
                         "/api/environments/archive", "/api/environments/restore", "/api/environments/delete"}:
@@ -222,6 +223,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/maintenance":
                 maintenance = self.server.service.update_maintenance(validate_settings(payload))
                 self._json(200, {"maintenance": maintenance})
+                return
+            if path == "/api/session-autosave":
+                settings = self.server.service.update_session_autosave(validate_session_settings(payload))
+                self._json(200, {"session_autosave": settings})
                 return
             if path == "/api/maintenance/run":
                 if payload:

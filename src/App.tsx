@@ -4,6 +4,7 @@ import BrowserTable from './components/BrowserTable';
 import EnvironmentDrawer from './components/EnvironmentDrawer';
 import ActionConfirm from './components/ActionConfirm';
 import MaintenancePanel from './components/MaintenancePanel';
+import SessionAutosavePanel from './components/SessionAutosavePanel';
 import CloseAllShopsDialog from './components/CloseAllShopsDialog';
 import CreateShopDialog from './components/CreateShopDialog';
 import StopWorkbenchDialog from './components/StopWorkbenchDialog';
@@ -19,7 +20,7 @@ const needsAttention = (environment: Environment) => environment.cdp === 'confli
 
 export default function App() {
   const { state, error, notice, refreshing, pendingIds, pendingStartJobs, submitting, refresh, runAction, dismissNotice,
-    saveMaintenance, runMaintenance, maintenanceSaving, maintenanceStarting, closeAllShops, closeAllSubmitting, closeAllPending,
+    saveMaintenance, runMaintenance, maintenanceSaving, maintenanceStarting, saveSessionAutosave, sessionAutosaveSaving, closeAllShops, closeAllSubmitting, closeAllPending,
     createShop, pickFolder, saveLoginCheck, changeRegistration, registrationIds, stopWorkbench, shutdownStatus, shutdownError, shutdownMessage } = useWorkbench();
   const [environmentView, setEnvironmentView] = useState<'active' | 'archived'>('active');
   const [registrationConfirm, setRegistrationConfirm] = useState<{ action: 'archive' | 'delete'; id: string } | null>(null);
@@ -137,6 +138,8 @@ export default function App() {
         <div className="summary-item" title="包含通过网址推定和平台接口验证的运行中环境"><span className="summary-icon violet-icon"><CheckCheck size={21} /></span><div><p>已登录（含推定）</p><strong>{state ? environments.filter(loggedIn).length : '—'}</strong><span>个</span></div></div>
       </section>
 
+      <SessionAutosavePanel key={state?.csrf_token} settings={state?.session_autosave} saving={sessionAutosaveSaving}
+        disabled={shutdownStatus !== 'running'} onSave={saveSessionAutosave} />
       <MaintenancePanel maintenance={state?.maintenance} saving={maintenanceSaving} starting={maintenanceStarting}
         onSave={saveMaintenance} onRun={runMaintenance} /></> : <p className="archived-view-help">归档环境不参与批量操作、登录统计和定时维护。恢复后可继续使用原有本地登录与下载数据。</p>}
 
