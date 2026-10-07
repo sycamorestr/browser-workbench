@@ -2,15 +2,19 @@
     [Parameter(Mandatory=$true)][string]$Registry,
     [string]$Python = 'python',
     [int]$Port = 17860,
+    [string]$RuntimeRoot = '',
     [switch]$NoShortcut
 )
 $ErrorActionPreference = 'Stop'
 $registryPath = (Resolve-Path -LiteralPath $Registry).Path
 $pythonPath = (Get-Command $Python -ErrorAction Stop).Source
 if ($Port -lt 1024 -or $Port -gt 65535) { throw '端口必须在 1024 至 65535 之间。' }
-$runtimeRoot = Join-Path $env:LOCALAPPDATA 'BrowserWorkbench'
-New-Item -Path $runtimeRoot -ItemType Directory -Force | Out-Null
+if (-not $RuntimeRoot) { $RuntimeRoot = Join-Path (Split-Path -Parent $registryPath) 'runtime' }
+$runtimeRoot = (New-Item -Path $RuntimeRoot -ItemType Directory -Force).FullName
 @{ registry = $registryPath; python = $pythonPath; port = $Port } | ConvertTo-Json | Set-Content -LiteralPath "$runtimeRoot\settings.json" -Encoding UTF8
+$localRuntime = Join-Path $PSScriptRoot 'runtime'
+New-Item -Path $localRuntime -ItemType Directory -Force | Out-Null
+Join-Path $runtimeRoot 'settings.json' | Set-Content -LiteralPath (Join-Path $localRuntime 'settings-path.txt') -Encoding UTF8
 if (-not $NoShortcut) {
     $desktopRoot = [Environment]::GetFolderPath('Desktop')
     $shell = New-Object -ComObject WScript.Shell

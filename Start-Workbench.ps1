@@ -1,9 +1,17 @@
-﻿param([string]$SettingsPath = "$env:LOCALAPPDATA\BrowserWorkbench\settings.json", [switch]$NoOpen)
+﻿param([string]$SettingsPath = '', [switch]$NoOpen)
 $ErrorActionPreference = 'Stop'
 $launchMutex = $null
 $lockTaken = $false
 try {
-    if (-not (Test-Path -LiteralPath $SettingsPath)) { throw '请先运行 Install-Local.ps1 配置浏览器登记文件。' }
+    if (-not $SettingsPath) {
+        $settingsPointer = Join-Path $PSScriptRoot 'runtime\settings-path.txt'
+        if (Test-Path -LiteralPath $settingsPointer) {
+            $SettingsPath = (Get-Content -LiteralPath $settingsPointer -Raw -Encoding UTF8).Trim()
+        } else {
+            $SettingsPath = Join-Path $env:LOCALAPPDATA 'BrowserWorkbench\settings.json'
+        }
+    }
+    if (-not $SettingsPath -or -not (Test-Path -LiteralPath $SettingsPath)) { throw "找不到本机配置：$SettingsPath`n请先运行 Install-Local.ps1 配置浏览器登记文件。" }
     $settings = Get-Content -LiteralPath $SettingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $projectRoot = $PSScriptRoot
     $panelPort = [int]$settings.port

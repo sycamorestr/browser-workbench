@@ -94,10 +94,10 @@ npm run build
 
 ### 2. 将空白清单复制到仓库之外
 
-以下默认把私有文件放在本机 `%LOCALAPPDATA%\BrowserWorkbenchData`。可以将 `$privateRoot` 改成自己的绝对路径，但必须放在仓库目录之外。重复执行会保留已有清单：
+以下默认把私有文件放在本机 `%USERPROFILE%\BrowserWorkbenchData`。可以将 `$privateRoot` 改成自己的绝对路径，但必须放在仓库目录之外。使用普通用户目录可避免 Windows 打包应用重定向 `AppData`，导致安装工具写入的文件无法从桌面启动时读取。重复执行会保留已有清单：
 
 ```powershell
-$privateRoot = Join-Path $env:LOCALAPPDATA 'BrowserWorkbenchData'
+$privateRoot = Join-Path $env:USERPROFILE 'BrowserWorkbenchData'
 New-Item -ItemType Directory -Path $privateRoot -Force | Out-Null
 $registry = Join-Path $privateRoot 'shops.json'
 if (-not (Test-Path -LiteralPath $registry)) {
@@ -121,6 +121,7 @@ New-Item -ItemType Directory -Path $environmentRoot -Force | Out-Null
 ```text
 BrowserWorkbenchData/
 ├─ shops.json                              原始空白清单，保持只读
+├─ runtime/                                本机入口配置与后台服务日志
 ├─ .browser-workbench-shops.json            网页创建的环境登记
 ├─ .browser-workbench-login-checks.json     各环境登录检查规则
 ├─ .browser-workbench-lifecycle.json        归档与删除登记状态
@@ -146,7 +147,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Start-Workbench.ps1
 
 此后双击桌面「浏览器工作台」或仓库中的 `启动工作台.cmd` 即可。专用环境使用独立数据目录，不复用日常浏览器的个人资料目录。右上角「停止工作台」可退出后台服务；若还要关闭活动浏览器，先完成「一键关闭全部环境」。
 
-本机入口配置位于 `%LOCALAPPDATA%\BrowserWorkbench\settings.json`，包含清单路径、虚拟环境 Python 路径和面板端口；服务日志也在此目录。安装后不要移动代码目录或 `.venv`；移动后应重新运行 `Install-Local.ps1` 更新入口。
+本机入口配置默认位于登记文件旁的 `runtime/settings.json`，按上述步骤即为 `%USERPROFILE%\BrowserWorkbenchData\runtime\settings.json`。文件包含清单路径、虚拟环境 Python 路径和面板端口；服务日志也在此目录。安装时可通过 `-RuntimeRoot` 指定其他目录。
+
+安装程序会在代码目录内已忽略的 `runtime/settings-path.txt` 中仅记录配置文件的位置，使桌面快捷方式和 `启动工作台.cmd` 使用同一份配置。启动时优先使用显式 `-SettingsPath`，其次使用这份路径记录；没有路径记录时，仍兼容旧版 `%LOCALAPPDATA%\BrowserWorkbench\settings.json`。路径记录失效时会显示具体缺失路径，不会自动切换到其他旧配置。
+
+安装后不要移动代码目录或 `.venv`；移动后应重新运行 `Install-Local.ps1` 更新入口。旧安装无需迁移即可继续运行。若遇到“安装工具中能启动、桌面双击却找不到配置”，请关闭工作台，将完整私有数据目录保留原件并复制到普通用户目录（不要只复制 `settings.json`），再将 `$registry` 指向复制后的 `shops.json`，重新运行安装命令。已有手工清单或浏览器配置若使用绝对路径，应一并检查并更新，避免继续引用原私有目录。
 
 调试时也可不安装桌面入口，直接在仓库根目录前台运行服务，随后打开[本机面板](http://127.0.0.1:17860)：
 
